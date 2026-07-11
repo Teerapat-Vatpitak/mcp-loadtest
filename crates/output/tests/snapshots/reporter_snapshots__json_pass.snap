@@ -1,0 +1,59 @@
+---
+source: crates/mcp-loadtest/tests/reporter_snapshots.rs
+expression: j
+---
+{
+  "run_id": "01HXYTESTPASS00000000000000",
+  "started_at": "2026-05-10T07:30:00Z",
+  "duration_secs": 60.0,
+  "scenario": {
+    "name": "sustained"
+  },
+  "server": {
+    "command": "python",
+    "args": [
+      "-m",
+      "vibe_trading_mcp"
+    ],
+    "pid": 4242,
+    "protocol_version": "2025-03-26"
+  },
+  "latency_ms": {
+    "p50": 12.3,
+    "p95": 45.6,
+    "p99": 89.0,
+    "p999": 120.0,
+    "min": 1.2,
+    "max": 150.0,
+    "mean": 23.400000000000002,
+    "count": 12345
+  },
+  "throughput": {
+    "total_requests": 12345,
+    "successful_requests": 12345,
+    "requests_per_sec": 205.75
+  },
+  "errors": {
+    "total": 0,
+    "by_category": {
+      "Hang": 0,
+      "Timeout": 0,
+      "ServerError": 0,
+      "ProtocolError": 0,
+      "Crash": 0,
+      "Malformed": 0,
+      "Disconnected": 0,
+      "Cancelled": 0
+    }
+  },
+  "process": {
+    "peak_rss_mb": 156.3,
+    "final_rss_mb": 142.1,
+    "avg_cpu_pct": 23.4
+  },
+  "deadlock_count": 0,
+  "hang_count": 0,
+  "trace_path": "./trace.jsonl",
+  "threshold_violations": [],
+  "passed": true
+}

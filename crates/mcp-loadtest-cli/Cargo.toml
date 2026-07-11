@@ -1,0 +1,57 @@
+[package]
+name = "mcp-loadtest-cli"
+description = "CLI for mcp-loadtest — detects deadlocks/hangs in MCP servers"
+keywords = ["mcp", "loadtest", "cli", "benchmark", "deadlock"]
+categories = ["development-tools::testing", "command-line-utilities"]
+documentation = "https://docs.rs/mcp-loadtest-cli"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# `cargo binstall mcp-loadtest-cli` support. Templates must match the asset
+# naming produced by .github/workflows/release.yml exactly:
+#   mcp-loadtest-<tag>-<target>.tar.gz   (linux / macOS)
+#   mcp-loadtest-<tag>-<target>.zip      (windows)
+# where <tag> = "v{ version }", each archive unpacking to a
+# mcp-loadtest-<tag>-<target>/ directory containing mcp-loadtest[.exe].
+# If release.yml's naming ever changes, change these templates in lockstep.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/mcp-loadtest-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "mcp-loadtest-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[lints]
+workspace = true
+
+[lib]
+name = "mcp_loadtest_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mcp-loadtest"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+# CLI binary needs both `serve` (for `mcp-loadtest serve --mcp`) and `tui`
+# (for the live dashboard) subcommands.
+mcp-loadtest = { path = "../mcp-loadtest", version = "0.0.1", features = ["serve", "tui"] }
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+humantime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

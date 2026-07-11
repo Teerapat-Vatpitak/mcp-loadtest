@@ -1,0 +1,33 @@
+[package]
+name = "mcp-loadtest-engine"
+description = "Scenario engine and run orchestration for mcp-loadtest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mcp-loadtest-core = { path = "../core", version = "0.0.1" }
+mcp-loadtest-protocol = { path = "../protocol", version = "0.0.1" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+sysinfo = { workspace = true }
+rand = { workspace = true }
+ulid = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+httpmock = "0.7"
+rand = { workspace = true }
+serde_json = { workspace = true }
+tokio-util = { workspace = true }

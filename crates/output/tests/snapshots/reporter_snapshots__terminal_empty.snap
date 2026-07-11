@@ -1,0 +1,18 @@
+---
+source: crates/mcp-loadtest/tests/reporter_snapshots.rs
+expression: s
+---
+mcp-loadtest run summary
+  status:    PASS
+  server:    python -m vibe_trading_mcp
+  scenario:  empty
+  duration:  0µs
+
+  requests:  0 total · 0 ok · 0 errors (0.00%)
+  rps:       0.0
+
+  latency:
+    p50:     0µs
+    p95:     0µs
+    p99:     0µs
+    max:     0µs

@@ -1,0 +1,24 @@
+---
+source: crates/mcp-loadtest/tests/reporter_snapshots.rs
+expression: s
+---
+mcp-loadtest run summary
+  status:    FAIL (1 threshold violation)
+  server:    python -m vibe_trading_mcp
+  scenario:  sustained
+  duration:  60.00s
+
+  requests:  12,345 total · 12,300 ok · 45 errors (0.36%)
+  rps:       205.8
+
+  latency:
+    p50:     12.3ms
+    p95:     45.6ms
+    p99:     123.4ms ❌ (expected <= 100ms)
+    max:     999.9ms
+
+  errors:    server_error=30 protocol_error=10 timeout=5
+
+  process:   peak=156.3 MB · final=142.1 MB · cpu=23.4%
+
+  trace:     ./trace.jsonl

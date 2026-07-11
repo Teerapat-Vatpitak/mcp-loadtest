@@ -1,0 +1,57 @@
+[package]
+name = "mcp-loadtest"
+description = "Load tester for MCP (Model Context Protocol) servers — detects deadlocks, hangs, and perf regressions"
+keywords = ["mcp", "loadtest", "stress-test", "benchmark", "deadlock"]
+# Library crate — "command-line-utilities" belongs to the CLI crate only.
+categories = ["development-tools::testing", "development-tools::profiling"]
+documentation = "https://docs.rs/mcp-loadtest"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+# CLAUDE.md files are agent/dev scaffolding, not library docs — keep them out
+# of the published crate.
+exclude = [
+    "CLAUDE.md",
+]
+
+# docs.rs builds with all features so the feature-gated `serve` / `tui`
+# modules render in the published API docs.
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
+
+[features]
+# Library-only consumers get a slim build (no MCP-server mode, no TUI).
+# The CLI binary opts in to both — see crates/mcp-loadtest-cli/Cargo.toml.
+default = []
+# Self-hosted MCP server mode (`mcp-loadtest serve --mcp`). Gates the
+# `pub mod serve` declaration in lib.rs. See ADR 0005.
+serve = []
+# Live-polling Ratatui dashboard. Forwards to the output crate's `tui`
+# feature (which activates `ratatui` + `crossterm`) and re-exports its `tui`
+# module from lib.rs.
+tui = ["mcp-loadtest-output/tui"]
+
+[dependencies]
+mcp-loadtest-core = { path = "../core", version = "0.0.1" }
+mcp-loadtest-protocol = { path = "../protocol", version = "0.0.1" }
+mcp-loadtest-engine = { path = "../engine", version = "0.0.1" }
+mcp-loadtest-output = { path = "../output", version = "0.0.1" }
+# The crate is a thin re-export facade over the four workspace crates above.
+# The only direct deps are what the feature-gated `serve` module uses (verified
+# by grep: serve/ imports tokio, serde_json, thiserror and nothing else).
+tokio = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# `smoke.rs` / `serve_smoke.rs` drive the built binary over async stdio; both
+# use only tokio + serde_json (the latter comes from the normal deps above).
+tokio = { workspace = true }

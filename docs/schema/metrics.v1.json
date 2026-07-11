@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Teerapat-Vatpitak/mcp-loadtest/blob/main/docs/schema/metrics.v1.json",
+  "title": "mcp-loadtest metrics.json (v1)",
+  "description": "Machine-readable run report emitted by the JSON reporter (`crate::report::json`). Mirrors `ReportView` field-for-field: Durations are fractional milliseconds, `started_at` is ISO 8601 UTC. Forward-compatible: additive fields may appear in later patch versions, so consumers should tolerate unknown properties.",
+  "type": "object",
+  "required": [
+    "run_id",
+    "started_at",
+    "duration_secs",
+    "scenario",
+    "server",
+    "latency_ms",
+    "throughput",
+    "errors",
+    "process",
+    "deadlock_count",
+    "hang_count",
+    "threshold_violations",
+    "passed"
+  ],
+  "properties": {
+    "run_id": { "type": "string", "description": "ULID identifying the run." },
+    "started_at": {
+      "type": "string",
+      "description": "Run start, ISO 8601 UTC."
+    },
+    "duration_secs": {
+      "type": "number",
+      "description": "Wall-clock run duration in seconds."
+    },
+    "scenario": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Scenario name (`Scenario::name()`)."
+        }
+      }
+    },
+    "server": {
+      "type": "object",
+      "required": ["command", "args"],
+      "properties": {
+        "command": { "type": "string" },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "pid": {
+          "type": "integer",
+          "description": "Present only while the server was running."
+        },
+        "protocol_version": {
+          "type": "string",
+          "description": "Server's reported MCP protocolVersion, if any."
+        }
+      }
+    },
+    "latency_ms": {
+      "type": "object",
+      "description": "Latency percentiles in fractional milliseconds.",
+      "required": ["p50", "p95", "p99", "p999", "min", "max", "mean", "count"],
+      "properties": {
+        "p50": { "type": "number" },
+        "p95": { "type": "number" },
+        "p99": { "type": "number" },
+        "p999": { "type": "number" },
+        "min": { "type": "number" },
+        "max": { "type": "number" },
+        "mean": { "type": "number" },
+        "count": {
+          "type": "integer",
+          "description": "Number of latency samples."
+        }
+      }
+    },
+    "throughput": {
+      "type": "object",
+      "required": ["total_requests", "successful_requests", "requests_per_sec"],
+      "properties": {
+        "total_requests": { "type": "integer" },
+        "successful_requests": { "type": "integer" },
+        "requests_per_sec": {
+          "type": "number",
+          "description": "Total calls divided by wall-clock run duration; with a session pool this reflects the aggregate N-worker rate."
+        }
+      }
+    },
+    "errors": {
+      "type": "object",
+      "required": ["total", "by_category"],
+      "properties": {
+        "total": {
+          "type": "integer",
+          "description": "total_requests - successful_requests."
+        },
+        "by_category": {
+          "type": "object",
+          "description": "Counts per CallOutcome error class.",
+          "required": [
+            "Hang",
+            "Timeout",
+            "ServerError",
+            "ProtocolError",
+            "Crash",
+            "Malformed",
+            "Disconnected",
+            "Cancelled"
+          ],
+          "properties": {
+            "Hang": { "type": "integer" },
+            "Timeout": { "type": "integer" },
+            "ServerError": { "type": "integer" },
+            "ProtocolError": { "type": "integer" },
+            "Crash": { "type": "integer" },
+            "Malformed": { "type": "integer" },
+            "Disconnected": { "type": "integer" },
+            "Cancelled": { "type": "integer" }
+          }
+        }
+      }
+    },
+    "process": {
+      "type": "object",
+      "required": ["peak_rss_mb", "final_rss_mb", "avg_cpu_pct"],
+      "properties": {
+        "peak_rss_mb": { "type": "number" },
+        "final_rss_mb": { "type": "number" },
+        "avg_cpu_pct": { "type": "number" }
+      }
+    },
+    "deadlock_count": { "type": "integer" },
+    "hang_count": { "type": "integer" },
+    "trace_path": {
+      "type": "string",
+      "description": "Path to the per-run trace; omitted when there is none."
+    },
+    "threshold_violations": {
+      "type": "array",
+      "description": "Empty array == every configured threshold passed.",
+      "items": {
+        "type": "object",
+        "required": ["metric", "expected", "actual"],
+        "properties": {
+          "metric": {
+            "type": "string",
+            "description": "Threshold slug, e.g. \"p99_latency\", \"error_rate\", \"memory_growth_mb\"."
+          },
+          "expected": { "type": "string" },
+          "actual": { "type": "string" }
+        }
+      }
+    },
+    "passed": {
+      "type": "boolean",
+      "description": "No threshold violations AND zero deadlocks."
+    }
+  }
+}

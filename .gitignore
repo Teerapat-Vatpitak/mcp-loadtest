@@ -1,0 +1,44 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Vibe-Trading regression-test fixture (cloned at test setup, see
+# tests/vibe_trading_regression.rs)
+/target/vibe-trading-fixture/
+
+# mcp-loadtest run artifacts
+/runs
+/crates/*/runs
+
+# Internal working docs and AI-workflow config — kept locally, not published
+/CLAUDE.md
+/AGENTS.md
+/PROJECT-STRUCTURE.md
+/POST_PUBLISH_ISSUES.md
+crates/**/CLAUDE.md
+/.claude/
+/.superpowers/
+/docs/plan/
+/docs/superpowers/
+/docs/blog/
+
+# Logs / temp
+*.log
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Python (for fixtures)
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Insta snapshots (review before commit)
+*.snap.new

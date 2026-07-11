@@ -1,0 +1,7 @@
+edition = "2024"
+max_width = 100
+newline_style = "Unix"
+
+# Nightly-only — uncomment when MSRV moves to nightly or stable supports them:
+# imports_granularity = "Crate"
+# group_imports = "StdExternalCrate"

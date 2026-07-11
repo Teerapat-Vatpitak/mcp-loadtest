@@ -1,0 +1,97 @@
+name: release
+
+# Builds prebuilt binaries for release tags and attaches them to the GitHub
+# Release (creating it if absent). No crates.io — ADR 0015.
+#
+# Triggers:
+#   - pushing a `v*` tag
+#   - manual run for an existing tag (workflow_dispatch with `tag`)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and release (e.g. v0.0.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust (stable + target)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
+
+      - name: Build CLI
+        run: cargo build --release --locked -p mcp-loadtest-cli --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          ver="${{ github.event.inputs.tag || github.ref_name }}"
+          dir="mcp-loadtest-${ver}-${{ matrix.target }}"
+          mkdir "$dir"
+          cp "target/${{ matrix.target }}/release/mcp-loadtest" "$dir/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$dir/"
+          tar -czf "${dir}.tar.gz" "$dir"
+          shasum -a 256 "${dir}.tar.gz" > "${dir}.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ver = "${{ github.event.inputs.tag || github.ref_name }}"
+          $dir = "mcp-loadtest-$ver-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/mcp-loadtest.exe" $dir
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          $h = (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash.ToLower()
+          # LF, no BOM, "<hash>  <name>" — matches the unix `shasum` sidecar so
+          # `sha256sum -c` works cross-platform (Out-File would emit CRLF).
+          [IO.File]::WriteAllText((Join-Path $PWD "$dir.zip.sha256"), "$h  $dir.zip`n")
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          # Each matrix job only produces its own-OS archive (unix→tar.gz,
+          # windows→zip); the shared globs below intentionally don't all match
+          # per job. The Build/Package steps are the real guards (they fail the
+          # job before this step if no binary was produced).
+          fail_on_unmatched_files: false
+          files: |
+            mcp-loadtest-*.tar.gz
+            mcp-loadtest-*.tar.gz.sha256
+            mcp-loadtest-*.zip
+            mcp-loadtest-*.zip.sha256
+          body: |
+            Prebuilt binaries for ${{ github.event.inputs.tag || github.ref_name }}. Full notes: [CHANGELOG.md](https://github.com/Teerapat-Vatpitak/mcp-loadtest/blob/main/CHANGELOG.md).
+
+            **Install from source** (not on crates.io — [ADR 0015](https://github.com/Teerapat-Vatpitak/mcp-loadtest/blob/main/docs/adr/0015-defer-crates-io-distribution.md)):
+
+            ```
+            cargo install --git https://github.com/Teerapat-Vatpitak/mcp-loadtest mcp-loadtest-cli
+            ```
+
+            Or download a prebuilt archive below (verify with the matching `.sha256`).

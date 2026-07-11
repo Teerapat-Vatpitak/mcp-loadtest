@@ -1,0 +1,22 @@
+---
+source: crates/mcp-loadtest/tests/reporter_snapshots.rs
+expression: s
+---
+mcp-loadtest run summary
+  status:    PASS
+  server:    python -m vibe_trading_mcp
+  scenario:  sustained
+  duration:  60.00s
+
+  requests:  12,345 total · 12,345 ok · 0 errors (0.00%)
+  rps:       205.8
+
+  latency:
+    p50:     12.3ms
+    p95:     45.6ms
+    p99:     89.0ms
+    max:     150.0ms
+
+  process:   peak=156.3 MB · final=142.1 MB · cpu=23.4%
+
+  trace:     ./trace.jsonl

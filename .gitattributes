@@ -1,0 +1,12 @@
+# Auto-detect text files; normalize to LF on commit.
+* text=auto eol=lf
+
+# Force LF for shell scripts (Windows users will commit CRLF otherwise → bash breaks)
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary

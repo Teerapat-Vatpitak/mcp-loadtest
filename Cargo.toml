@@ -1,0 +1,61 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Teerapat-Vatpitak/mcp-loadtest"
+homepage = "https://github.com/Teerapat-Vatpitak/mcp-loadtest"
+authors = ["Teerapat Vatpitak"]
+rust-version = "1.88"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hdrhistogram = "7"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sysinfo = "0.32"
+async-trait = "0.1"
+console = "0.15"
+crossterm = "0.28"
+eventsource-stream = "0.2"
+humantime = "2"
+ratatui = "0.29"
+humantime-serde = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+tokio-stream = "0.1"
+tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+url = "2"
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.8"
+indicatif = "0.17"
+ulid = "1"
+anyhow = "1"
+rand = "0.9"
+criterion = "0.5"
+
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
+# CLI tool — unwinding tables add ~500 KB and we never recover from panics
+# in normal use (every panic path is a bug or OS-level fault). `abort` keeps
+# the binary lean and surfaces failures faster.
+panic = "abort"
+
+[profile.bench]
+debug = true

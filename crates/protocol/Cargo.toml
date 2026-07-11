@@ -1,0 +1,42 @@
+[package]
+name = "mcp-loadtest-protocol"
+description = "MCP wire protocol, transports (stdio/http/sse/ws), session, hang detector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mcp-loadtest-core = { path = "../core", version = "0.0.1" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
+url = { workspace = true }
+tracing = { workspace = true }
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true }
+httpmock = "0.7"
+criterion = { workspace = true }
+async-trait = { workspace = true }
+
+[[bench]]
+name = "session_loopback"
+harness = false
+
+[[bench]]
+name = "hang_detect"
+harness = false

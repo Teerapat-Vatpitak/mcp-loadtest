@@ -1,0 +1,260 @@
+name: "mcp-loadtest"
+# Marketplace requires < 125 chars. Longer pitch lives in README +
+# docs/examples/ci-integration.md. (Install details: prebuilt binary,
+# sha256-verified, cargo-install fallback.)
+description: >-
+  Load-test an MCP server in CI: deadlock probe, sustained load, cross-server
+  compare, or doctor. Fails the job on regression.
+author: "Teerapat Vatpitak"
+branding:
+  icon: "activity"
+  color: "orange"
+
+inputs:
+  version:
+    description: >-
+      Release tag to install (e.g. "v0.0.1"). "latest" resolves the most
+      recent GitHub Release of Teerapat-Vatpitak/mcp-loadtest.
+    required: false
+    default: "latest"
+  command:
+    description: >-
+      Subcommand to run: "deadlock-probe" (default), "run", "cross", or
+      "doctor". For "run", pass `--config <file>` via `args` — the server is
+      defined in the TOML config.
+    required: false
+    default: "deadlock-probe"
+  server:
+    description: >-
+      Server command string passed to --server, e.g. "python -m my_mcp".
+      Ignored by `command: run` (the TOML config carries the server) but
+      still echoed into the job summary.
+    required: true
+  args:
+    description: >-
+      Extra CLI args appended verbatim, parsed with shell quoting rules, e.g.
+      --tool get_market_data --args '{"ticker":"AAPL"}'
+    required: false
+    default: ""
+  baseline:
+    description: >-
+      Optional path to a baseline metrics.json. When set, the action also
+      runs `mcp-loadtest compare <baseline> <run>/metrics.json` after the
+      main command and fails on regression.
+    required: false
+    default: ""
+  working-directory:
+    description: "Directory to run the command in."
+    required: false
+    default: "."
+
+outputs:
+  report-dir:
+    description: >-
+      Directory of the newest run report (contains report.md + metrics.json),
+      e.g. ./runs/<run-id>. Assumes the default ./runs output dir unless
+      --output-dir was overridden via `args`.
+    value: ${{ steps.run.outputs.report-dir }}
+  passed:
+    description: '"true" when the tool (and compare, if any) exited 0, else "false".'
+    value: ${{ steps.run.outputs.passed }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install mcp-loadtest
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        repo="Teerapat-Vatpitak/mcp-loadtest"
+
+        # --- resolve the release tag -----------------------------------------
+        tag="${INPUT_VERSION}"
+        if [ "$tag" = "latest" ]; then
+          if command -v gh >/dev/null 2>&1 && [ -n "${GH_TOKEN:-}" ]; then
+            tag="$(gh release view --repo "$repo" --json tagName --jq .tagName)"
+          else
+            # Token is optional here (public repo) but lifts the rate limit.
+            auth=()
+            if [ -n "${GH_TOKEN:-}" ]; then
+              auth=(-H "Authorization: Bearer ${GH_TOKEN}")
+            fi
+            tag="$(curl -fsSL --retry 3 "${auth[@]}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${repo}/releases/latest" \
+              | sed -n 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*$/\1/p' \
+              | head -n 1)"
+          fi
+        fi
+        if [ -z "$tag" ]; then
+          echo "::error::could not resolve a release tag for ${repo}"
+          exit 1
+        fi
+        echo "MCP_LOADTEST_VERSION=${tag}" >> "$GITHUB_ENV"
+
+        # --- map runner -> release target ------------------------------------
+        target=""
+        ext=""
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64)   target="x86_64-unknown-linux-gnu"; ext="tar.gz" ;;
+          macOS-ARM64) target="aarch64-apple-darwin";     ext="tar.gz" ;;
+          macOS-X64)   target="x86_64-apple-darwin";      ext="tar.gz" ;;
+          Windows-X64) target="x86_64-pc-windows-msvc";   ext="zip" ;;
+        esac
+
+        if [ -z "$target" ]; then
+          echo "no prebuilt binary for ${RUNNER_OS}/${RUNNER_ARCH} — falling back to cargo install --git"
+          if ! command -v cargo >/dev/null 2>&1; then
+            echo "::error::cargo not found; install Rust (e.g. dtolnay/rust-toolchain@stable) before this action on ${RUNNER_OS}/${RUNNER_ARCH} runners"
+            exit 1
+          fi
+          cargo install --git "https://github.com/${repo}" --tag "$tag" --locked mcp-loadtest-cli
+          echo "${HOME}/.cargo/bin" >> "$GITHUB_PATH"
+          exit 0
+        fi
+
+        # Asset names must match the packaging in .github/workflows/release.yml:
+        #   mcp-loadtest-<tag>-<target>.{tar.gz|zip}  (+ ".sha256" sidecar)
+        asset="mcp-loadtest-${tag}-${target}.${ext}"
+        base="https://github.com/${repo}/releases/download/${tag}"
+        dist="${RUNNER_TEMP}/mcp-loadtest-dist"
+        mkdir -p "$dist"
+        cd "$dist"
+
+        # Unauthenticated on purpose: release downloads on a public repo need
+        # no token, and the cross-host redirect to object storage rejects
+        # requests that still carry an Authorization header.
+        curl -fsSL --retry 3 -o "$asset" "${base}/${asset}"
+        curl -fsSL --retry 3 -o "${asset}.sha256" "${base}/${asset}.sha256"
+
+        if command -v sha256sum >/dev/null 2>&1; then
+          sha256sum -c "${asset}.sha256"
+        else
+          shasum -a 256 -c "${asset}.sha256"
+        fi
+
+        if [ "$ext" = "zip" ]; then
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -oq "$asset"
+          elif command -v 7z >/dev/null 2>&1; then
+            7z x -y "$asset" >/dev/null
+          else
+            powershell.exe -NoProfile -Command "Expand-Archive -Force -LiteralPath '$asset' -DestinationPath '.'"
+          fi
+        else
+          tar -xzf "$asset"
+        fi
+
+        # Archives unpack to mcp-loadtest-<tag>-<target>/mcp-loadtest[.exe]
+        bin_dir="${dist}/mcp-loadtest-${tag}-${target}"
+        if [ ! -f "${bin_dir}/mcp-loadtest" ] && [ ! -f "${bin_dir}/mcp-loadtest.exe" ]; then
+          echo "::error::unexpected archive layout — no mcp-loadtest binary in ${bin_dir}"
+          exit 1
+        fi
+        if [ "${RUNNER_OS}" = "Windows" ]; then
+          cygpath -w "$bin_dir" >> "$GITHUB_PATH"
+        else
+          echo "$bin_dir" >> "$GITHUB_PATH"
+        fi
+        echo "installed mcp-loadtest ${tag} (${target})"
+
+    - name: Run mcp-loadtest
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_SERVER: ${{ inputs.server }}
+        INPUT_ARGS: ${{ inputs.args }}
+        INPUT_BASELINE: ${{ inputs.baseline }}
+      run: |
+        case "${INPUT_COMMAND}" in
+          run|deadlock-probe|cross|doctor) ;;
+          *)
+            echo "::error::unsupported command '${INPUT_COMMAND}' (expected: deadlock-probe | run | cross | doctor)"
+            exit 2
+            ;;
+        esac
+
+        argv=(mcp-loadtest "${INPUT_COMMAND}")
+        case "${INPUT_COMMAND}" in
+          deadlock-probe|cross|doctor) argv+=(--server "${INPUT_SERVER}") ;;
+          run) ;; # server comes from the TOML config passed via `args`
+        esac
+        if [ -n "${INPUT_ARGS:-}" ]; then
+          # `args` is documented as shell-quoted, so JSON like
+          # --args '{"ticker":"AAPL"}' survives word-splitting intact.
+          eval 'argv+=('"${INPUT_ARGS}"')'
+        fi
+
+        echo "::group::${argv[*]}"
+        status=0
+        "${argv[@]}" || status=$?
+        echo "::endgroup::"
+
+        # Newest run dir under ./runs (the tool's default --output-dir).
+        report_dir="./runs"
+        latest="$(ls -1td ./runs/*/ 2>/dev/null | head -n 1 || true)"
+        if [ -n "$latest" ]; then
+          report_dir="${latest%/}"
+        fi
+
+        compare_status=0
+        compare_md=""
+        if [ -n "${INPUT_BASELINE:-}" ]; then
+          current="${report_dir}/metrics.json"
+          if [ -f "$current" ]; then
+            compare_md="$(mcp-loadtest compare "${INPUT_BASELINE}" "$current" --format markdown)" || compare_status=$?
+          else
+            echo "::error::baseline set but no metrics.json found at ${current}"
+            compare_status=1
+          fi
+        fi
+
+        passed=false
+        if [ "$status" -eq 0 ] && [ "$compare_status" -eq 0 ]; then
+          passed=true
+        fi
+
+        {
+          echo "## mcp-loadtest: \`${INPUT_COMMAND}\`"
+          echo ""
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Server | \`${INPUT_SERVER}\` |"
+          echo "| Version | \`${MCP_LOADTEST_VERSION:-unknown}\` |"
+          echo "| Result | **${passed}** (exit ${status}) |"
+          echo "| Report dir | \`${report_dir}\` |"
+        } >> "$GITHUB_STEP_SUMMARY"
+        if [ -n "$compare_md" ] || [ "$compare_status" -ne 0 ]; then
+          {
+            echo ""
+            echo "### Baseline comparison (exit ${compare_status})"
+            echo ""
+            printf '%s\n' "$compare_md"
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+        if [ -f "${report_dir}/report.md" ]; then
+          {
+            echo ""
+            echo "<details><summary>report.md</summary>"
+            echo ""
+            head -n 120 "${report_dir}/report.md"
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        {
+          echo "report-dir=${report_dir}"
+          echo "passed=${passed}"
+        } >> "$GITHUB_OUTPUT"
+
+        # Explicit failure semantics: a non-zero tool (or compare) exit fails
+        # this step, and therefore the caller's job.
+        if [ "$status" -ne 0 ]; then
+          exit "$status"
+        fi
+        exit "$compare_status"

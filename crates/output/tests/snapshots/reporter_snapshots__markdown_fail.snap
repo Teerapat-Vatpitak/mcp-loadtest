@@ -1,0 +1,37 @@
+---
+source: crates/mcp-loadtest/tests/reporter_snapshots.rs
+expression: md
+---
+# Run 01HXYTESTFAIL00000000000000
+
+**Status:** ❌ FAIL (1 threshold violation)
+**Server:** `python -m vibe_trading_mcp`
+**Scenario:** sustained
+**Started:** 2026-05-10T07:30:00Z
+
+## Summary
+- Total requests: 12,345
+- Throughput: 205.75 req/s
+- Error rate: 0.36%
+- Deadlocks: 0  Hangs: 0
+
+## Latency
+| p50 | p95 | p99 | p999 | max |
+|---|---|---|---|---|
+| 12.3ms | 45.6ms | **123.4ms** ❌ | 456.7ms | 999.9ms |
+
+## Errors
+| Category | Count |
+|---|---|
+| Timeout | 5 |
+| ServerError | 30 |
+| ProtocolError | 10 |
+
+## Process
+Peak RSS: 156.3 MB · Final RSS: 142.1 MB · Avg CPU: 23.4%
+
+## Threshold violations
+- ❌ **p99_latency**: expected <= 100ms, got 123.4ms
+
+## Trace
+Full trace: `./trace.jsonl` (12345 events)

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/<OWNER>/<REPO>/security/policy
+    about: Please report security issues via the policy in SECURITY.md instead of a public issue.
+  - name: General question or usage help
+    url: https://github.com/<OWNER>/<REPO>/discussions
+    about: For usage questions, design discussions, or feature brainstorming. Discussions tab must be enabled first.
