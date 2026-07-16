@@ -12,12 +12,6 @@ ignore = [
     # `paste` no longer maintained. Transitive proc-macro (no direct dep);
     # not a vulnerability; no drop-in upstream migration available yet.
     "RUSTSEC-2024-0436",
-    # `lru` IterMut Stacked-Borrows unsoundness. Transitive via ratatui 0.29,
-    # and only present under the optional `tui` feature (default lib build
-    # excludes it). No semver-compatible fix within ratatui 0.29's `lru ^0.12`
-    # constraint. Low practical impact (internal TUI cache). Revisit when
-    # ratatui ships on patched lru.
-    "RUSTSEC-2026-0002",
 ]
 
 [licenses]
