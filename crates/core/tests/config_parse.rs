@@ -203,6 +203,29 @@ fn rejects_unknown_transport() {
 }
 
 #[test]
+fn rejects_ws_without_url() {
+    // `ws` is a URL transport like http/sse — a config without `server.url`
+    // can never connect and must be rejected at load, not at runtime.
+    let toml_in = r#"
+        [server]
+        transport = "ws"
+
+        [scenario]
+        type = "sustained"
+    "#;
+    let err = Config::from_toml_str(toml_in).expect_err("ws without url must be rejected");
+    match err {
+        ConfigError::Invalid(msg) => {
+            assert!(
+                msg.contains("server.url") && msg.contains("ws"),
+                "error message should mention server.url + the transport, got: {msg}"
+            );
+        }
+        other => panic!("expected ConfigError::Invalid, got {other:?}"),
+    }
+}
+
+#[test]
 fn syntactic_toml_error_is_toml_variant() {
     // Unbalanced brackets: triggers the parser, not the validator.
     let toml_in = r#"

@@ -44,7 +44,7 @@ pub(super) fn validate(cfg: &Config) -> Result<(), ConfigError> {
                 "server.command is required when transport = \"stdio\"".into(),
             ));
         }
-        "http" | "sse" if cfg.server.url.is_none() => {
+        "http" | "sse" | "ws" if cfg.server.url.is_none() => {
             return Err(ConfigError::Invalid(format!(
                 "server.url is required when transport = \"{}\"",
                 cfg.server.transport
