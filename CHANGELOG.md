@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Config validation now rejects `transport = "ws"` without `server.url` at
+  load time (previously the missing URL only surfaced at connect).
+- `deadlock-probe --explain` (and its source, DESIGN §21.4) now describe the
+  shipped sequential probe — the barrier-released concurrent burst remains
+  M8+ backlog per DESIGN §15.2 — and document the quick-subcommand vs
+  `run`-config defaults (5 / 2s / 5s vs 20 / 5s / 10s).
+
+### Changed
+
+- Grading: the concurrency dimension's note now discloses inline that
+  `total_requests` is a proxy for concurrency capacity (e.g.
+  `sustained requests 1234 -> A (>= 100; proxy for concurrency)`).
+
 ## [0.0.1] — 2026-07-11
 
 First release. `mcp-loadtest` is a cross-platform load tester and bug detector
