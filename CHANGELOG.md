@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Stdio `Session` now tolerates server-initiated JSON-RPC notifications
+  (`notifications/tools/list_changed`, progress updates, etc.) interleaved
+  with responses — including a notification emitted before the `initialize`
+  result. Previously the transport read the next line as the response, so a
+  leading notification desynced the stream and every call was misclassified
+  `malformed` (found by dogfooding against the MCP reference "everything"
+  server: 100% malformed → 0 errors after the fix). The response read now
+  skips notification frames (a `method`, no `id`) up to a bounded cap.
 - `compare` now exits non-zero when any regression flag fires, as `--explain`
   and the composite GitHub Action's gating contract (DESIGN.md §15.4) always
   documented. Previously it printed the diff and exited 0, so regressions
