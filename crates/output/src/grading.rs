@@ -170,11 +170,18 @@ pub fn grade(report: &Report, profile: &GradingProfile) -> GradeReport {
         u64::from(profile.concurrency[2]),
         u64::from(profile.concurrency[3]),
     ];
+    // The note discloses the proxy inline (see module docs) so a CI log
+    // reader isn't misled into reading it as measured in-flight concurrency.
     let (concurrency, concurrency_note) = grade_descending(
         total,
         conc_tiers,
-        |g, bound| format!("sustained requests {total} -> {g} (>= {bound})"),
-        || format!("sustained requests {total} -> F (< {})", conc_tiers[3]),
+        |g, bound| format!("sustained requests {total} -> {g} (>= {bound}; proxy for concurrency)"),
+        || {
+            format!(
+                "sustained requests {total} -> F (< {}; proxy for concurrency)",
+                conc_tiers[3]
+            )
+        },
     );
 
     let (error_rate, error_note) = grade_error_rate(&metrics.outcomes, profile);
