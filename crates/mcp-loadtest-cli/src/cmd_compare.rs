@@ -67,15 +67,25 @@ impl CompareFormat {
 
 // ---- entry point --------------------------------------------------------
 
+/// What the dispatch arm needs to print and exit on.
+#[derive(Debug)]
+pub struct CompareOutcome {
+    /// Diff rendered in the requested format.
+    pub rendered: String,
+    /// The underlying diff — `has_regression` drives the exit code.
+    pub report: CompareReport,
+}
+
 /// Run the `compare` subcommand. Reads two JSON files, builds a diff using
 /// `thresholds` (pass [`RegressionThresholds::default`] for the historical
-/// policy), and renders it in the requested format to stdout.
+/// policy), and renders it in the requested format. The caller prints
+/// `rendered` and then applies [`gate`] so regressions exit non-zero.
 pub fn run(
     baseline: &Path,
     current: &Path,
     format: CompareFormat,
     thresholds: &RegressionThresholds,
-) -> Result<String> {
+) -> Result<CompareOutcome> {
     let base = read_report(baseline)?;
     let cur = read_report(current)?;
     let report = build_report(&base, &cur, thresholds);
@@ -85,7 +95,26 @@ pub fn run(
             serde_json::to_string_pretty(&report).context("serializing compare report to json")?
         }
     };
-    Ok(rendered)
+    Ok(CompareOutcome { rendered, report })
+}
+
+/// CI gate (DESIGN.md §15.4): error — and therefore exit non-zero — when any
+/// regression flag fired. Called after the diff has been printed, mirroring
+/// how `run` bails on threshold violations.
+pub fn gate(report: &CompareReport) -> Result<()> {
+    if report.has_regression {
+        let metrics: Vec<&str> = report
+            .regressions
+            .iter()
+            .map(|m| m.metric.as_str())
+            .collect();
+        anyhow::bail!(
+            "{} regression flag(s) fired: {} — see diff above",
+            report.regressions.len(),
+            metrics.join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn read_report(path: &Path) -> Result<ComparableReport> {

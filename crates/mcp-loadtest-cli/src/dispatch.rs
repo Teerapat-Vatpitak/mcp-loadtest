@@ -89,9 +89,9 @@ pub(crate) async fn dispatch(cmd: Cmd) -> Result<()> {
                 error_rate_pp: max_error_rate_regression_pp,
                 deadlock_zero_tolerance: !allow_deadlock_increase,
             };
-            let rendered = cmd_compare::run(&baseline, &current, fmt, &thresholds)?;
-            print_stdout(&rendered);
-            Ok(())
+            let outcome = cmd_compare::run(&baseline, &current, fmt, &thresholds)?;
+            print_stdout(&outcome.rendered);
+            cmd_compare::gate(&outcome.report)
         }
         Cmd::DeadlockProbe {
             server,

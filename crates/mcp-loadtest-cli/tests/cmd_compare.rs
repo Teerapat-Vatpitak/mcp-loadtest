@@ -84,7 +84,8 @@ fn compare_flags_p99_regression() {
         CompareFormat::Markdown,
         &RegressionThresholds::default(),
     )
-    .expect("compare run");
+    .expect("compare run")
+    .rendered;
 
     assert!(
         md.contains("REGRESSION"),
@@ -118,7 +119,8 @@ fn compare_no_regression_on_identical_reports() {
         CompareFormat::Markdown,
         &RegressionThresholds::default(),
     )
-    .expect("compare run");
+    .expect("compare run")
+    .rendered;
 
     assert!(
         md.contains("no regressions"),
@@ -145,7 +147,8 @@ fn compare_flags_deadlock_uptick() {
         CompareFormat::Markdown,
         &RegressionThresholds::default(),
     )
-    .expect("compare run");
+    .expect("compare run")
+    .rendered;
     assert!(md.contains("REGRESSION"), "expected regression on deadlock");
     assert!(md.contains("deadlock_count"));
 }
@@ -169,7 +172,8 @@ fn compare_json_output_structure() {
         CompareFormat::Json,
         &RegressionThresholds::default(),
     )
-    .expect("compare run");
+    .expect("compare run")
+    .rendered;
 
     let v: serde_json::Value = serde_json::from_str(&json_out).expect("parse json output");
     assert_eq!(v["baseline_run_id"], "01BASE");
@@ -233,7 +237,7 @@ fn custom_thresholds_flip_the_regression_verdict() {
         &RegressionThresholds::default(),
     )
     .expect("compare run (strict)");
-    assert_eq!(parse(&strict)["has_regression"], true);
+    assert_eq!(parse(&strict.rendered)["has_regression"], true);
 
     // Loosen p99 budget to 20% → same +15% delta is now within budget.
     let lax = cmd_compare::run(
@@ -246,5 +250,68 @@ fn custom_thresholds_flip_the_regression_verdict() {
         },
     )
     .expect("compare run (lax)");
-    assert_eq!(parse(&lax)["has_regression"], false);
+    assert_eq!(parse(&lax.rendered)["has_regression"], false);
+}
+
+#[test]
+fn gate_fails_on_regression_so_compare_exits_non_zero() {
+    // The CI-gate contract from `--explain` / action.yml: after rendering,
+    // `compare` must exit non-zero when any regression flag fired. The
+    // dispatch arm implements that by calling `cmd_compare::gate` on the
+    // outcome's report — assert the gate errors here.
+    let dir = tempdir().expect("tempdir");
+    let baseline_path = dir.path().join("baseline.json");
+    let current_path = dir.path().join("current.json");
+
+    fs::write(
+        &baseline_path,
+        synthetic_metrics_json("01BASE", 100.0, 0, 0),
+    )
+    .expect("write baseline");
+    fs::write(&current_path, synthetic_metrics_json("01CUR", 250.0, 0, 0)).expect("write current");
+
+    let outcome = cmd_compare::run(
+        &baseline_path,
+        &current_path,
+        CompareFormat::Markdown,
+        &RegressionThresholds::default(),
+    )
+    .expect("compare run");
+
+    assert!(outcome.report.has_regression);
+    let err = cmd_compare::gate(&outcome.report).expect_err("gate must fail on regression");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("regression"),
+        "gate error should mention regressions: {msg}"
+    );
+    assert!(
+        msg.contains("latency_p99_ms"),
+        "gate error should name the regressed metric: {msg}"
+    );
+}
+
+#[test]
+fn gate_passes_when_no_regression() {
+    let dir = tempdir().expect("tempdir");
+    let baseline_path = dir.path().join("baseline.json");
+    let current_path = dir.path().join("current.json");
+
+    fs::write(
+        &baseline_path,
+        synthetic_metrics_json("01BASE", 100.0, 0, 0),
+    )
+    .expect("write baseline");
+    fs::write(&current_path, synthetic_metrics_json("01CUR", 100.0, 0, 0)).expect("write current");
+
+    let outcome = cmd_compare::run(
+        &baseline_path,
+        &current_path,
+        CompareFormat::Markdown,
+        &RegressionThresholds::default(),
+    )
+    .expect("compare run");
+
+    assert!(!outcome.report.has_regression);
+    cmd_compare::gate(&outcome.report).expect("gate must pass on a clean diff");
 }

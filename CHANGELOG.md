@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `compare` now exits non-zero when any regression flag fires, as `--explain`
+  and the composite GitHub Action's gating contract (DESIGN.md §15.4) always
+  documented. Previously it printed the diff and exited 0, so regressions
+  passed CI. The diff is still rendered to stdout first; the failure line
+  names the regressed metrics.
 - Config validation now rejects `transport = "ws"` without `server.url` at
   load time (previously the missing URL only surfaced at connect).
 - `deadlock-probe --explain` (and its source, DESIGN §21.4) now describe the
