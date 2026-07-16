@@ -1282,16 +1282,22 @@ Algorithm:
   2. Send `initialize`. Wait up to startup_timeout (default 10s).
   3. Send `notifications/initialized`.
   4. Send `tools/list`. Wait up to 1s.
-  5. Synchronization barrier — N concurrent `tools/call` ready to fire.
-  6. Release barrier. All N calls fire in parallel.
-  7. Each call wrapped in hang_detect(hang_threshold=5s, grace_period=10s):
+  5. Issue N sequential `tools/call` probes against the same session.
+     (The barrier-released concurrent burst of DESIGN §15.2 needs the
+     multi-session pool — M8+ backlog. The lazy-init bug class hangs
+     regardless of concurrency, so the probe still catches it.)
+  6. Each call wrapped in hang_detect(hang_threshold, grace_period):
      - response within hang_threshold → SUCCESS
      - response between threshold and grace_period → SLOW (warning)
      - no response after grace_period → DEADLOCK (critical)
-  8. Report aggregated results.
+  7. Bail on the first DEADLOCK — the session is wedged — and report.
+
+Defaults: this subcommand probes quickly (N=5, hang_threshold=2s,
+  grace_period=5s); `run` with `[scenario] type = "deadlock_probe"` is the
+  thorough CI form (N=20, hang_threshold=5s, grace_period=10s).
 
 Tunable knobs: --concurrent, --hang-threshold, --grace-period.
-See DESIGN.md §15.2 for the spec source.
+See DESIGN.md §15.2 for the spec source (and its "Shipped reality" note).
 ```
 
 LLMs use this to plan the right invocation. Reduces "I tried it but it didn't do what I expected" loops.

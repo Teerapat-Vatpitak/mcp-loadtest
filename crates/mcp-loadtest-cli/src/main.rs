@@ -138,7 +138,8 @@ pub(crate) enum Cmd {
         /// Tool name to call.
         #[arg(long, default_value = "echo")]
         tool: String,
-        /// Number of sequential probe iterations.
+        /// Number of sequential `tools/call` probes (quick default; the
+        /// `run` config form of this scenario defaults to 20).
         #[arg(long, default_value_t = 5)]
         concurrent: u32,
         /// Per-call hang threshold (humantime: `2s`, `500ms`, ...).
