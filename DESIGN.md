@@ -947,7 +947,7 @@ Simple, but worth specifying so the report's `passed()` is unambiguous.
 
 ## 16. Mock server specs
 
-Mocks live in `tests/fixtures/<name>.py`. Each is < 50 lines of Python — minimal MCP server using stdio + JSON-RPC by hand (no fastmcp dep, to avoid version coupling). Shipped fixtures: `mock-normal.py`, `mock-slow.py`, `mock-broken.py`, `mock-crash.py`, `mock-leak.py`, `mock-error.py`, `mock-slow-init.py`, `mock-malformed.py`, plus `mock-http-server.py` and `mock-sse-server.py` (transport parity coverage). Pseudocode for each below.
+Mocks live in `tests/fixtures/<name>.py`. Each is < 50 lines of Python — minimal MCP server using stdio + JSON-RPC by hand (no fastmcp dep, to avoid version coupling). Shipped fixtures: `mock-normal.py`, `mock-slow.py`, `mock-broken.py`, `mock-crash.py`, `mock-leak.py`, `mock-error.py`, `mock-slow-init.py`, `mock-malformed.py`, plus `mock-http-server.py` and `mock-sse-server.py` (transport parity coverage), `mock-schema.py` / `mock-output-schema.py` (strict args/result validation — ADR 0010), and `mock-stateless-http.py` (2026-07-28 stateless mode — ADR 0019). Shared helpers live in `_common.py`; the canonical inventory is `crates/engine/tests/fixtures/CLAUDE.md`. Pseudocode for the original eight + transport pair below.
 
 ### 16.1 mock-normal.py
 

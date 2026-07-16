@@ -28,7 +28,7 @@ The regression test that catches the exact Vibe-Trading commit lives at [`tests/
 
 ## What it does
 
-- **Bug-class detection** — `deadlock_probe` (N concurrent `tools/call`s, each classified success / slow / deadlock), `race_check` (diffs identical calls to surface non-determinism), and a hang-detector watchdog wrapping every call in every scenario.
+- **Bug-class detection** — `deadlock_probe` (N sequential `tools/call` probes, each classified success / slow / deadlock; the lazy-init bug class hangs regardless of concurrency), `race_check` (diffs identical calls to surface non-determinism), and a hang-detector watchdog wrapping every call in every scenario.
 - **Load testing** — `sustained` / `ramp` / `spike` / `soak` with p50/p95/p99/p999 histograms, cold-start handshake measurement, weighted pattern mixes, and periodic RSS sampling for leak hunting.
 - **Record & replay** — `run --trace <file>` records every JSON-RPC frame as versioned JSONL (secret-looking arguments redacted by default); `replay <file> --server "..."` re-runs the trace against a fresh server and diffs responses, exiting non-zero on divergence ([ADR 0021](https://github.com/Teerapat-Vatpitak/mcp-loadtest/blob/main/docs/adr/0021-trace-record-replay.md)).
 - **Reporting** — ANSI terminal, markdown, self-contained HTML, and schema-stable `metrics.json` ([docs/schema/metrics.v1.json](https://github.com/Teerapat-Vatpitak/mcp-loadtest/blob/main/docs/schema/metrics.v1.json), pinned by a conformance test). `compare` diffs two runs for regressions; `cross` runs N servers side by side.
