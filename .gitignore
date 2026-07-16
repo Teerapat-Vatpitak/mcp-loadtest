@@ -17,6 +17,8 @@ Cargo.lock.bak
 /PROJECT-STRUCTURE.md
 /POST_PUBLISH_ISSUES.md
 crates/**/CLAUDE.md
+# …except the mock-fixtures guide, which is tracked so it shows up in worktrees
+!crates/engine/tests/fixtures/CLAUDE.md
 /.claude/
 /.superpowers/
 /docs/plan/
