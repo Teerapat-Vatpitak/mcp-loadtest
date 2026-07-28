@@ -19,6 +19,31 @@ assert_eq() {
   fi
 }
 
+assert_same_path() {
+  local expected="$1"
+  local actual="$2"
+  local context="$3"
+  local python_cmd=""
+
+  if command -v python3 >/dev/null 2>&1; then
+    python_cmd="python3"
+  elif command -v python >/dev/null 2>&1; then
+    python_cmd="python"
+  else
+    fail "${context}: Python is required to compare paths"
+  fi
+
+  if ! "$python_cmd" - "$expected" "$actual" <<'PY'
+import os
+import sys
+
+raise SystemExit(0 if os.path.samefile(sys.argv[1], sys.argv[2]) else 1)
+PY
+  then
+    fail "${context}: expected path <${expected}>, got <${actual}>"
+  fi
+}
+
 assert_count() {
   local expected="$1"
   local context="$2"
@@ -118,7 +143,7 @@ mcp_loadtest_collect_run_dirs "$deadlock_root"
 if [ "${#MCP_LOADTEST_RUN_DIRS[@]}" -ne 1 ]; then
   fail "expected exactly one report inside the Action-owned root"
 fi
-assert_eq \
+assert_same_path \
   "${deadlock_root}/${owned_run}" \
   "${MCP_LOADTEST_RUN_DIRS[0]}" \
   "Action-owned invocation report"
