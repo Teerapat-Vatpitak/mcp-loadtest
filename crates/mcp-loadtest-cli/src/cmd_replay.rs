@@ -29,7 +29,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bound on the post-replay transport shutdown. This stays above stdio's
 /// composed internal kill/reap/pump budget.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Parsed CLI args for the subcommand.
 #[derive(Debug)]
@@ -150,9 +150,18 @@ fn render(report: &ReplayReport) -> String {
 
 #[cfg(test)]
 mod tests {
+    use mcp_loadtest::protocol::transport::stdio::StdioTransport;
     use mcp_loadtest::trace::Divergence;
 
     use super::*;
+
+    #[test]
+    fn shutdown_guard_keeps_scheduler_margin() {
+        assert!(
+            SHUTDOWN_TIMEOUT >= StdioTransport::SHUTDOWN_BUDGET + Duration::from_secs(6),
+            "replay shutdown guard must exceed stdio's composed budget"
+        );
+    }
 
     #[test]
     fn render_clean_report_is_one_line() {

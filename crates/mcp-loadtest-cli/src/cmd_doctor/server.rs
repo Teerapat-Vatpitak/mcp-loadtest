@@ -20,11 +20,12 @@ const REDACTED_FIX: &str = "the server failed to initialize — verify the comma
 const TEARDOWN_FIX: &str =
     "the server initialized but did not shut down cleanly — inspect its lifecycle handlers";
 /// Whole constructor budget. This must exceed `Session`'s 10s startup budget
-/// plus its 15s failed-startup cleanup guard; otherwise doctor could cancel
-/// explicit teardown and fall back to an unproven Drop-only kill.
-const SMOKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// plus its 20s failed-startup cleanup guard and scheduling/file-open margin;
+/// otherwise doctor could cancel explicit teardown and fall back to an
+/// unproven Drop-only kill.
+const SMOKE_TIMEOUT: Duration = Duration::from_secs(40);
 /// Margin above stdio's composed internal shutdown phase budget.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 /// How many trailing stderr lines to echo on failure.
 const STDERR_TAIL_LINES: usize = 20;
 
@@ -168,7 +169,22 @@ fn ulid_like() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use mcp_loadtest::protocol::transport::stdio::StdioTransport;
+
     use super::*;
+
+    #[test]
+    fn lifecycle_guards_keep_scheduler_margin() {
+        let margin = Duration::from_secs(6);
+        assert!(
+            SHUTDOWN_TIMEOUT >= StdioTransport::SHUTDOWN_BUDGET + margin,
+            "doctor shutdown guard must exceed stdio's composed budget"
+        );
+        assert!(
+            SMOKE_TIMEOUT >= Duration::from_secs(10) + SHUTDOWN_TIMEOUT + margin,
+            "doctor constructor guard must cover startup, failed-startup cleanup, and margin"
+        );
+    }
 
     #[tokio::test]
     async fn no_server_is_a_skip_pass() {

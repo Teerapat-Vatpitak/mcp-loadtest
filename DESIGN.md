@@ -715,9 +715,9 @@ a query. Literal header secrets, OAuth login/refresh/discovery, interactive
 authorization, and token persistence are not implemented.
 
 Shutdown is not configurable. Stdio applies bounded graceful-exit,
-forced-kill/reap, stderr EOF-drain, and cancellation-fallback phases (11
-seconds of internal phase budgets); scenario/run outer guards allow 15 seconds
-total, leaving a 4-second scheduling margin. Any shutdown
+forced-kill/reap, stderr EOF-drain, and cancellation-fallback phases (14
+seconds of internal phase budgets); scenario/run outer guards allow 20 seconds
+total, leaving a 6-second scheduling margin. Any shutdown
 error or outer timeout increments a typed teardown-failure counter and gates
 the report instead of being swallowed. `kill_on_drop` remains only a
 last-resort termination request when a future is cancelled before orderly

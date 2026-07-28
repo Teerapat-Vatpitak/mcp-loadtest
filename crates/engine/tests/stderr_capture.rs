@@ -36,6 +36,7 @@ mod helpers;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mcp_loadtest_core::config::Config;
@@ -279,6 +280,20 @@ async fn process_exited(pid: u32) -> bool {
     }
 }
 
+/// One fresh process-table observation with no grace period. This distinguishes
+/// "shutdown proved reap before returning" from "shutdown requested a kill
+/// and the process happened to disappear shortly afterwards."
+fn process_absent_now(pid: u32) -> bool {
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::new(),
+    );
+    system.process(pid).is_none()
+}
+
 #[tokio::test]
 async fn capture_writes_server_stderr_to_file() {
     let py = helpers::python();
@@ -428,29 +443,57 @@ async fn concurrent_forced_shutdowns_reap_every_child() {
     }
 
     let mut shutdowns = tokio::task::JoinSet::new();
-    for (index, session) in sessions.into_iter().enumerate() {
-        shutdowns.spawn(async move { (index, session.shutdown().await) });
+    let start = Arc::new(tokio::sync::Barrier::new(CONCURRENT_REAP_CHILDREN + 1));
+    for ((index, session), pid) in sessions.into_iter().enumerate().zip(pids.iter().copied()) {
+        let start = Arc::clone(&start);
+        shutdowns.spawn(async move {
+            start.wait().await;
+            let result = session.shutdown().await;
+            let absent_at_return = process_absent_now(pid);
+            (index, pid, result, absent_at_return)
+        });
     }
+    start.wait().await;
 
-    tokio::time::timeout(
+    let failures = tokio::time::timeout(
         StdioTransport::SHUTDOWN_BUDGET + SHUTDOWN_SCHEDULING_MARGIN,
         async {
+            let mut failures = Vec::new();
             while let Some(joined) = shutdowns.join_next().await {
-                let (index, result) =
+                let (index, pid, result, absent_at_return) =
                     joined.unwrap_or_else(|error| panic!("shutdown task failed: {error}"));
-                result.unwrap_or_else(|error| panic!("session {index} shutdown failed: {error}"));
+                if let Err(error) = result {
+                    failures.push(format!("session {index} shutdown failed: {error}"));
+                }
+                if !absent_at_return {
+                    failures.push(format!(
+                        "session {index} returned before child PID {pid} was absent"
+                    ));
+                }
             }
+            failures
         },
     )
     .await
     .expect("concurrent forced shutdown wave exceeded its composed budget");
 
+    // If a task failed its immediate proof, still give the OS a short cleanup
+    // window so the test leaves no child behind and the diagnostic can
+    // distinguish "late exit" from a genuinely leaked process.
+    let mut cleanup_failures = Vec::new();
     for pid in pids {
-        assert!(
-            process_exited(pid).await,
-            "concurrent shutdown returned while child PID {pid} was still alive"
-        );
+        if !process_exited(pid).await {
+            cleanup_failures.push(format!(
+                "child PID {pid} remained alive after cleanup grace"
+            ));
+        }
     }
+    assert!(
+        failures.is_empty() && cleanup_failures.is_empty(),
+        "concurrent shutdown proof failed: {}; cleanup: {}",
+        failures.join("; "),
+        cleanup_failures.join("; ")
+    );
 }
 
 #[tokio::test]
