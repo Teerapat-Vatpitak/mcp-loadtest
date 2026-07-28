@@ -12,7 +12,7 @@ use super::ScenarioOutcome;
 /// composed internal shutdown budget. Keeping this deadline strictly
 /// greater prevents an outer timer from pre-empting forced kill/reap and stderr
 /// pump cleanup.
-pub(crate) const SCENARIO_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const SCENARIO_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Shut down one owned session and turn lifecycle uncertainty into a typed,
 /// report-gating outcome signal.

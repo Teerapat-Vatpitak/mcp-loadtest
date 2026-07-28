@@ -18,7 +18,7 @@ use crate::transport::{Transport, TransportError};
 /// Startup failures still own a live transport. Give teardown enough room to
 /// complete stdio's composed shutdown budget instead of relying on
 /// `kill_on_drop`, which requests termination but cannot prove reap/log drain.
-pub(super) const FAILED_STARTUP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const FAILED_STARTUP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Preserve the original startup error when cleanup succeeds. If cleanup is
 /// uncertain, surface both facts as one fail-closed transport error.

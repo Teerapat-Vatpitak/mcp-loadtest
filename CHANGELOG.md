@@ -138,9 +138,15 @@ workspace version was never tagged or released.
   an accepted termination was misreported as a 2-second forced-reap timeout.
   Stdio teardown now reconciles both graceful and forced async-wait failures
   with a direct `try_wait` probe: a proven exit/reap succeeds, a still-live
-  process or failed probe remains a typed failure. The release procedure keeps
-  the original failed JUnit and logs as unresolved local evidence rather than
-  discarding them.
+  process or failed probe remains a typed failure. A follow-up strict run
+  proved that some processes really remained live after the old 2-second
+  forced budget, so forced reap now has a bounded 5 seconds and its outer
+  lifecycle guards retain scheduling margin. Nextest limits engine
+  integration-test binaries to four at once while a focused regression still
+  drives eight stubborn child shutdowns concurrently; scenario-level
+  concurrency tests retain their real worker counts. The release procedure
+  keeps the original failed JUnit and logs as unresolved local evidence rather
+  than discarding them.
 - The hang watchdog now classifies successful calls from elapsed wall time,
   not merely the winning `select!` branch. Under a saturated executor the call
   future and threshold timer could become ready in the same poll; the old

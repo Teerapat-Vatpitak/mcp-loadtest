@@ -13,7 +13,12 @@ use crate::transport::TransportError;
 /// Let an EOF-aware server perform its normal cleanup first.
 const GRACEFUL_CHILD_EXIT_BUDGET: Duration = Duration::from_secs(5);
 /// After requesting termination, wait for the OS to confirm exit/reap.
-const FORCED_CHILD_REAP_BUDGET: Duration = Duration::from_secs(2);
+///
+/// Windows can keep a process observable as live for more than two seconds
+/// after accepting `TerminateProcess` when many subprocesses exit together.
+/// Give forced cleanup the same bounded allowance as graceful cleanup; the
+/// final direct process-table probe still decides success versus timeout.
+const FORCED_CHILD_REAP_BUDGET: Duration = Duration::from_secs(5);
 /// After the child exits, let the stderr pump drain the closed pipe through
 /// EOF. Cancelling before this phase completes can discard bytes that were
 /// already written by the child but still queued in the pipe/reader.

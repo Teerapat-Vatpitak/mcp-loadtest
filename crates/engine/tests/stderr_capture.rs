@@ -21,6 +21,8 @@
 //!   writes `runs/<id>/server-stderr.log` and completes a short scenario.
 //! - `graceful_shutdown_drains_burst_tail_before_cancelling_pump` — a large
 //!   post-EOF stderr burst is captured completely before shutdown returns.
+//! - `concurrent_forced_shutdowns_reap_every_child` — eight stubborn children
+//!   cross the forced-kill boundary together and must all be proven reaped.
 
 // `helpers` is shared across integration-test binaries; this file uses only
 // `python()` (the inline server is passed via `python -c`, no fixture file),
@@ -64,6 +66,7 @@ const EOF_TAIL_MARKER: &str = "STDERR-EOF-TAIL-mcp-loadtest-f2";
 const EOF_BURST_PREFIX: &str = "STDERR-EOF-BURST-mcp-loadtest-f2-";
 const EOF_BURST_FINAL_MARKER: &str = "STDERR-EOF-BURST-FINAL-mcp-loadtest-f2";
 const EOF_BURST_LINES: usize = 1_024;
+const CONCURRENT_REAP_CHILDREN: usize = 8;
 
 /// A minimal stdlib-only MCP server as a single `python -c` program. Writes
 /// `STDERR_MARKER` to stderr (flushed) immediately, then services the
@@ -398,6 +401,56 @@ async fn stubborn_eof_server_is_killed_reaped_and_flushes_tail() {
         process_exited(pid).await,
         "forced shutdown returned while child PID {pid} was still alive"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_forced_shutdowns_reap_every_child() {
+    let py = helpers::python();
+    let script = stubborn_eof_server_script();
+    let mut sessions = Vec::with_capacity(CONCURRENT_REAP_CHILDREN);
+    let mut pids = Vec::with_capacity(CONCURRENT_REAP_CHILDREN);
+
+    // Complete handshakes before releasing the shutdown wave. This test is
+    // specifically about concurrent EOF/terminate/reap behavior, not Python
+    // startup throughput.
+    for index in 0..CONCURRENT_REAP_CHILDREN {
+        let session =
+            tokio::time::timeout(TEST_TIMEOUT, Session::spawn(&py, ["-c", script.as_str()]))
+                .await
+                .unwrap_or_else(|_| panic!("session {index} startup timed out"))
+                .unwrap_or_else(|error| panic!("session {index} startup failed: {error}"));
+        pids.push(
+            session
+                .pid()
+                .unwrap_or_else(|| panic!("session {index} must expose a child PID")),
+        );
+        sessions.push(session);
+    }
+
+    let mut shutdowns = tokio::task::JoinSet::new();
+    for (index, session) in sessions.into_iter().enumerate() {
+        shutdowns.spawn(async move { (index, session.shutdown().await) });
+    }
+
+    tokio::time::timeout(
+        StdioTransport::SHUTDOWN_BUDGET + SHUTDOWN_SCHEDULING_MARGIN,
+        async {
+            while let Some(joined) = shutdowns.join_next().await {
+                let (index, result) =
+                    joined.unwrap_or_else(|error| panic!("shutdown task failed: {error}"));
+                result.unwrap_or_else(|error| panic!("session {index} shutdown failed: {error}"));
+            }
+        },
+    )
+    .await
+    .expect("concurrent forced shutdown wave exceeded its composed budget");
+
+    for pid in pids {
+        assert!(
+            process_exited(pid).await,
+            "concurrent shutdown returned while child PID {pid} was still alive"
+        );
+    }
 }
 
 #[tokio::test]

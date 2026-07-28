@@ -1,7 +1,20 @@
+[test-groups.engine-subprocess]
+# Engine integration tests deliberately create their own concurrent MCP
+# session pools. Letting nextest launch 24 of those test binaries at once on a
+# high-core Windows host multiplies into an uncontrolled subprocess wave and
+# tests host process-table saturation rather than the scenario contracts.
+# Four binaries still overlap while each concurrency/race/spike regression
+# retains its real internal worker count.
+max-threads = 4
+
 [profile.ci]
 fail-fast = false
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
+filter = 'package(mcp-loadtest-engine) & kind(test)'
+test-group = 'engine-subprocess'
 
 [profile.ci.junit]
 path = "junit.xml"
@@ -12,6 +25,10 @@ store-failure-output = true
 [profile.stress]
 inherits = "ci"
 retries = 0
+
+[[profile.stress.overrides]]
+filter = 'package(mcp-loadtest-engine) & kind(test)'
+test-group = 'engine-subprocess'
 
 [profile.stress.junit]
 path = "junit.xml"
