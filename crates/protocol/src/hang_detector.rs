@@ -160,6 +160,9 @@ mod tests {
 
     #[tokio::test]
     async fn executor_stall_cannot_turn_an_over_threshold_call_into_ok() {
+        let hang_threshold = Duration::from_millis(5);
+        let grace_period = Duration::from_millis(100);
+        let deadlock_threshold = hang_threshold + grace_period;
         let fut = async {
             // Simulate the runtime worker being unable to poll the watchdog
             // while the call itself occupies that poll. When select resumes,
@@ -167,11 +170,18 @@ mod tests {
             std::thread::sleep(Duration::from_millis(30));
             Ok::<CallToolResult, SessionError>(ok_result())
         };
-        let outcome = hang_detect(fut, Duration::from_millis(5), Duration::from_millis(100)).await;
-        assert!(
-            matches!(outcome, HangOutcome::Slow { .. }),
-            "elapsed wall time above the threshold must not be classified Ok: {outcome:?}"
-        );
+        let outcome = hang_detect(fut, hang_threshold, grace_period).await;
+        match outcome {
+            HangOutcome::Slow { duration, .. } => assert!(
+                duration >= hang_threshold && duration < deadlock_threshold,
+                "Slow must stay inside the grace budget: {duration:?}"
+            ),
+            HangOutcome::Deadlock { hung_for } => assert!(
+                hung_for >= deadlock_threshold,
+                "Deadlock must consume the threshold and grace budget: {hung_for:?}"
+            ),
+            other => panic!("elapsed wall time above the threshold must fail closed: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -181,10 +191,15 @@ mod tests {
             Ok::<CallToolResult, SessionError>(ok_result())
         };
         let outcome = hang_detect(fut, Duration::from_millis(5), Duration::from_millis(10)).await;
-        assert!(
-            matches!(outcome, HangOutcome::Deadlock { .. }),
-            "elapsed wall time beyond threshold + grace must be a deadlock: {outcome:?}"
-        );
+        match outcome {
+            HangOutcome::Deadlock { hung_for } => assert!(
+                hung_for >= Duration::from_millis(15),
+                "Deadlock must consume the threshold and grace budget: {hung_for:?}"
+            ),
+            other => {
+                panic!("elapsed wall time beyond threshold + grace must be a deadlock: {other:?}")
+            }
+        }
     }
 
     #[tokio::test]
