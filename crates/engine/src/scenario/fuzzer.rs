@@ -31,11 +31,13 @@
 //!
 //! Each iteration's outcome maps to a [`FuzzClass`] (see the `classify` /
 //! `raw` submodules and [`mcp_loadtest_core::fuzz_report`]): server acceptance →
-//! `Accepted`, protocol-range JSON-RPC error → `ProtocolError` (the expected,
-//! healthy outcome), other server error → `ServerError`, client-side parse /
-//! id mismatch → `ParseError`, transport / io failure → `Disconnected`, and no
-//! response within budget → `Deadlock`. `Deadlock` / `Disconnected` /
-//! malformed `Accepted` are the interesting findings worth surfacing.
+//! `Accepted`, explicit JSON-RPC `-32700` / `-32600` / `-32601` / `-32602`
+//! rejection or `tools/call` `isError: true` → `ProtocolError` (the expected,
+//! healthy outcome), other server error (including `-32603`) → `ServerError`,
+//! client-side parse / id mismatch → `ParseError`, transport / io failure →
+//! `Disconnected`, and no response within budget → `Deadlock`. `Deadlock` /
+//! `Disconnected` / malformed `Accepted` are the interesting findings worth
+//! surfacing.
 //!
 //! ## Module layout
 //!
@@ -61,14 +63,74 @@ use serde_json::Value;
 pub use payloads::FuzzPayload;
 
 use crate::scenario::{RunContext, Scenario, ScenarioOutcome};
-use classify::{classify_err, push_report_notes};
+use classify::{classify_err, is_expected_tool_rejection, push_report_notes};
 use mcp_loadtest_core::fuzz_report::{FuzzClass, FuzzFinding, FuzzReport};
 use mcp_loadtest_core::metrics::CallOutcome;
 use mcp_loadtest_protocol::Session;
 use mcp_loadtest_protocol::hang_detector::{HangOutcome, hang_detect};
+use mcp_loadtest_protocol::mcp::CallToolResult;
 
 /// Default cap on per-iteration findings retained in the aggregated report.
 const DEFAULT_MAX_FINDINGS: usize = 64;
+
+/// Record a completed typed `tools/call` fuzz probe.
+///
+/// A logical tool error is an explicit, healthy rejection of the deliberately
+/// bad input. A normal result means the malformed input was accepted and is an
+/// unexpected fuzzer error. Slow acceptance retains `Hang` telemetry but also
+/// increments `error_count`, so a mixed cohort cannot render a false PASS.
+fn record_completed_probe(
+    payload: FuzzPayload,
+    result: &CallToolResult,
+    duration: Duration,
+    slow: bool,
+    ctx: &RunContext,
+    outcome: &mut ScenarioOutcome,
+    findings: &mut Vec<FuzzFinding>,
+) {
+    if slow {
+        outcome.hang_count += 1;
+    }
+
+    if is_expected_tool_rejection(result) {
+        outcome.successful_calls += 1;
+        ctx.metrics.record(duration, CallOutcome::ExpectedRejection);
+        findings.push(FuzzFinding {
+            payload: payload.label().to_string(),
+            class: FuzzClass::ProtocolError,
+            code: None,
+            note: format!(
+                "server rejected malformed tools/call via isError=true in {}ms{}",
+                duration.as_millis(),
+                if slow { " (slow)" } else { "" }
+            ),
+        });
+    } else {
+        outcome.error_count += 1;
+        ctx.metrics.record(
+            duration,
+            if slow {
+                CallOutcome::Hang
+            } else {
+                CallOutcome::Malformed
+            },
+        );
+        findings.push(FuzzFinding {
+            payload: payload.label().to_string(),
+            class: FuzzClass::Accepted,
+            code: None,
+            note: format!(
+                "server accepted malformed input in {}ms{}",
+                duration.as_millis(),
+                if slow {
+                    " (slow; input validation may be too permissive)"
+                } else {
+                    " (suspicious — input validation may be too permissive)"
+                }
+            ),
+        });
+    }
+}
 
 /// Drive a [`Session`] with malformed payloads and classify the responses.
 pub struct Fuzzer {
@@ -175,35 +237,24 @@ impl Scenario for Fuzzer {
             let hang_outcome = hang_detect(call_fut, ctx.hang_threshold, ctx.grace_period).await;
 
             match hang_outcome {
-                HangOutcome::Ok { duration, .. } => {
-                    // Server accepting a *malformed* payload is the most
-                    // interesting fuzzer failure mode — record as Malformed,
-                    // not Success, so threshold evaluators surface it.
-                    outcome.error_count += 1;
-                    ctx.metrics.record(duration, CallOutcome::Malformed);
-                    findings.push(FuzzFinding {
-                        payload: payload.label().to_string(),
-                        class: FuzzClass::Accepted,
-                        code: None,
-                        note: format!(
-                            "server accepted malformed input in {}ms (suspicious — input validation may be too permissive)",
-                            duration.as_millis()
-                        ),
-                    });
-                }
-                HangOutcome::Slow { duration, .. } => {
-                    outcome.hang_count += 1;
-                    ctx.metrics.record(duration, CallOutcome::Hang);
-                    findings.push(FuzzFinding {
-                        payload: payload.label().to_string(),
-                        class: FuzzClass::Accepted,
-                        code: None,
-                        note: format!(
-                            "server accepted (slow): {}ms — interesting if input was malformed",
-                            duration.as_millis()
-                        ),
-                    });
-                }
+                HangOutcome::Ok { result, duration } => record_completed_probe(
+                    payload,
+                    &result,
+                    duration,
+                    false,
+                    ctx,
+                    &mut outcome,
+                    &mut findings,
+                ),
+                HangOutcome::Slow { result, duration } => record_completed_probe(
+                    payload,
+                    &result,
+                    duration,
+                    true,
+                    ctx,
+                    &mut outcome,
+                    &mut findings,
+                ),
                 HangOutcome::Deadlock { hung_for } => {
                     outcome.deadlock_count += 1;
                     ctx.metrics.record(hung_for, CallOutcome::Deadlock);
@@ -225,15 +276,24 @@ impl Scenario for Fuzzer {
                     break;
                 }
                 HangOutcome::Err(e) => {
-                    outcome.error_count += 1;
                     let (class, code, note) = classify_err(&e);
                     let metric_outcome = match class {
-                        FuzzClass::ProtocolError => CallOutcome::ProtocolError,
+                        FuzzClass::ProtocolError => CallOutcome::ExpectedRejection,
                         FuzzClass::ServerError => CallOutcome::ServerError,
                         FuzzClass::ParseError => CallOutcome::Malformed,
                         FuzzClass::Disconnected => CallOutcome::Disconnected,
                         _ => CallOutcome::ServerError,
                     };
+                    // A protocol-level rejection is the expected healthy
+                    // response to malformed fuzz input. Count the probe as a
+                    // scenario success and preserve it as ExpectedRejection
+                    // in metrics. Crashes, client-side protocol failures,
+                    // malformed replies and server errors remain failures.
+                    if class == FuzzClass::ProtocolError {
+                        outcome.successful_calls += 1;
+                    } else {
+                        outcome.error_count += 1;
+                    }
                     ctx.metrics.record(Duration::ZERO, metric_outcome);
                     findings.push(FuzzFinding {
                         payload: payload.label().to_string(),
@@ -284,8 +344,24 @@ impl Scenario for Fuzzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    use mcp_loadtest_core::metrics::Recorder;
     use mcp_loadtest_protocol::SessionError;
+    use mcp_loadtest_protocol::mcp::Content;
     use payloads::nested_object;
+    use tokio_util::sync::CancellationToken;
+
+    fn tool_result(is_error: bool) -> CallToolResult {
+        CallToolResult {
+            content: vec![Content::Text {
+                text: "result".to_owned(),
+            }],
+            is_error,
+            structured_content: None,
+            meta: None,
+        }
+    }
 
     #[test]
     fn name_is_stable() {
@@ -417,5 +493,70 @@ mod tests {
         let (class, code, _note) = classify_err(&err);
         assert_eq!(class, FuzzClass::Disconnected);
         assert_eq!(code, None);
+    }
+
+    #[test]
+    fn classify_err_client_side_schema_failure_is_not_expected_rejection() {
+        let err = SessionError::SchemaViolation {
+            tool: "echo".to_owned(),
+            summary: "required property missing".to_owned(),
+        };
+        let (class, code, note) = classify_err(&err);
+        assert_eq!(class, FuzzClass::Other);
+        assert_eq!(code, None);
+        assert!(note.contains("client-side"), "got: {note}");
+    }
+
+    #[test]
+    fn mixed_expected_rejection_and_slow_acceptance_fails_closed() {
+        let recorder = Recorder::new();
+        let ctx = RunContext::new(
+            Instant::now(),
+            CancellationToken::new(),
+            recorder.clone(),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+        let mut outcome = ScenarioOutcome {
+            total_calls: 2,
+            ..ScenarioOutcome::default()
+        };
+        let mut findings = Vec::new();
+
+        record_completed_probe(
+            FuzzPayload::UnknownMethod,
+            &tool_result(true),
+            Duration::from_millis(1),
+            false,
+            &ctx,
+            &mut outcome,
+            &mut findings,
+        );
+        record_completed_probe(
+            FuzzPayload::UnknownMethod,
+            &tool_result(false),
+            Duration::from_millis(20),
+            true,
+            &ctx,
+            &mut outcome,
+            &mut findings,
+        );
+
+        let metrics = recorder.snapshot();
+        assert_eq!(outcome.successful_calls, 1);
+        assert_eq!(
+            outcome.error_count, 1,
+            "slow acceptance must make a mixed fuzzer cohort fail closed"
+        );
+        assert_eq!(outcome.hang_count, 1);
+        assert_eq!(metrics.outcomes.expected_rejection, 1);
+        assert_eq!(
+            metrics.outcomes.hang, 1,
+            "slow accepted input must retain Hang telemetry"
+        );
+        assert_eq!(metrics.throughput.total_requests, 2);
+        assert_eq!(metrics.throughput.successful_requests, 1);
+        assert_eq!(findings[0].class, FuzzClass::ProtocolError);
+        assert_eq!(findings[1].class, FuzzClass::Accepted);
     }
 }

@@ -15,6 +15,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+const SSE_EVENT_LIMIT: usize = 16 * 1024 * 1024;
+const SSE_AGGREGATE_LIMIT: usize = 32 * 1024 * 1024;
+
 /// The mock SSE server binds to `127.0.0.1:0`, so every `connect` here dials a
 /// loopback IP literal. The SSRF guard (ADR 0012) blocks loopback literals
 /// unless they are explicitly in `allowed_hosts` (the operator escape hatch).
@@ -118,6 +121,10 @@ impl MockServer {
         let _ = self
             .events_tx
             .send(format!("event: message\ndata: {json_body}\n\n"));
+    }
+
+    fn send_raw_chunk(&self, chunk: impl Into<String>) {
+        let _ = self.events_tx.send(chunk.into());
     }
 
     /// Block until a POST body arrives. Panics if the channel closes.
@@ -250,6 +257,31 @@ async fn connect_handshakes_endpoint_event() {
 }
 
 #[tokio::test]
+async fn server_selected_endpoint_reapplies_url_policy_without_leaking_userinfo() {
+    const SECRET: &str = "endpoint-password-sentinel";
+    let server = MockServer::start().await;
+    let authority = server
+        .base_url
+        .strip_prefix("http://")
+        .expect("mock URL authority");
+    server.send_endpoint(&format!("http://operator:{SECRET}@{authority}/rpc"));
+
+    let err = SseTransport::connect(server.sse_url(), &loopback_guard())
+        .await
+        .err()
+        .expect("server-selected URL userinfo must be rejected");
+    let diagnostic = err.to_string();
+    assert!(
+        diagnostic.contains("userinfo"),
+        "wrong endpoint rejection: {diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains(SECRET),
+        "server-selected URL credential leaked: {diagnostic}"
+    );
+}
+
+#[tokio::test]
 async fn request_correlates_by_id() {
     let server = MockServer::start().await;
     let sse_url = server.sse_url();
@@ -356,4 +388,160 @@ async fn drop_without_shutdown_does_not_hang() {
     })
     .await
     .expect("drop-without-shutdown blocked");
+}
+
+#[tokio::test]
+async fn chunked_no_length_oversized_endpoint_is_rejected_before_dispatch() {
+    const SENTINEL: &str = "endpoint-body-secret-sentinel";
+    let server = MockServer::start().await;
+    server.send_raw_chunk(format!("event: endpoint\ndata: {SENTINEL}"));
+    for _ in 0..=SSE_EVENT_LIMIT / (64 * 1024) {
+        server.send_raw_chunk("x".repeat(64 * 1024));
+    }
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(15),
+        SseTransport::connect(server.sse_url(), &loopback_guard()),
+    )
+    .await
+    .expect("oversized endpoint rejection timed out")
+    .err()
+    .expect("oversized endpoint must be rejected");
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("limit"), "{diagnostic}");
+    assert!(!diagnostic.contains(SENTINEL), "{diagnostic}");
+}
+
+#[tokio::test]
+async fn chunked_no_length_oversized_message_is_rejected_without_body_echo() {
+    const SENTINEL: &str = "message-body-secret-sentinel";
+    let server = MockServer::start().await;
+    server.send_endpoint("/rpc");
+    let mut transport = SseTransport::connect(server.sse_url(), &loopback_guard())
+        .await
+        .expect("connect");
+
+    let request = tokio::spawn(async move {
+        let result = transport
+            .request(r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#)
+            .await;
+        (transport, result)
+    });
+    let _posted = server.next_post().await;
+    server.send_raw_chunk(format!("event: message\ndata: {SENTINEL}"));
+    for _ in 0..=SSE_EVENT_LIMIT / (64 * 1024) {
+        server.send_raw_chunk("x".repeat(64 * 1024));
+    }
+
+    let (transport, result) = tokio::time::timeout(Duration::from_secs(15), request)
+        .await
+        .expect("oversized message rejection timed out")
+        .expect("request task panicked");
+    let diagnostic = result
+        .expect_err("oversized message must fail the request")
+        .to_string();
+    assert!(diagnostic.contains("limit"), "{diagnostic}");
+    assert!(!diagnostic.contains(SENTINEL), "{diagnostic}");
+    let shutdown = Box::new(transport)
+        .shutdown()
+        .await
+        .expect_err("latched parser failure must also fail shutdown");
+    assert!(shutdown.to_string().contains("limit"));
+    assert!(!shutdown.to_string().contains(SENTINEL));
+}
+
+#[tokio::test]
+async fn exact_message_boundary_is_accepted() {
+    let server = MockServer::start().await;
+    server.send_endpoint("/rpc");
+    let mut transport = SseTransport::connect(server.sse_url(), &loopback_guard())
+        .await
+        .expect("connect");
+
+    // Three sequential maximum-size frames exceed the 32 MiB aggregate
+    // budget unless each returned frame releases its byte permit.
+    for id in [8, 9, 10] {
+        let request_body = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#);
+        let request = tokio::spawn(async move {
+            let result = transport.request(&request_body).await;
+            (transport, result)
+        });
+        let _posted = server.next_post().await;
+
+        let prefix = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"padding":""#);
+        let suffix = r#""}}"#;
+        let mut body = String::with_capacity(SSE_EVENT_LIMIT);
+        body.push_str(&prefix);
+        body.push_str(&"x".repeat(SSE_EVENT_LIMIT - prefix.len() - suffix.len()));
+        body.push_str(suffix);
+        assert_eq!(body.len(), SSE_EVENT_LIMIT);
+        server.send_message(&body);
+
+        let joined = tokio::time::timeout(Duration::from_secs(15), request)
+            .await
+            .expect("boundary response timed out")
+            .expect("request task panicked");
+        transport = joined.0;
+        assert_eq!(
+            joined.1.expect("exact-boundary message accepted").len(),
+            SSE_EVENT_LIMIT
+        );
+    }
+    Box::new(transport).shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn inbound_channel_and_pending_share_real_byte_budget() {
+    const SENTINEL: &str = "aggregate-body-secret-sentinel";
+    const FRAME_BYTES: usize = 12 * 1024 * 1024;
+    const {
+        assert!(FRAME_BYTES < SSE_EVENT_LIMIT);
+        assert!(FRAME_BYTES * 2 < SSE_AGGREGATE_LIMIT);
+        assert!(FRAME_BYTES * 3 > SSE_AGGREGATE_LIMIT);
+    }
+
+    let server = MockServer::start().await;
+    server.send_endpoint("/rpc");
+    let mut transport = SseTransport::connect(server.sse_url(), &loopback_guard())
+        .await
+        .expect("connect");
+    let request = tokio::spawn(async move {
+        let result = transport
+            .request(r#"{"jsonrpc":"2.0","id":999,"method":"ping"}"#)
+            .await;
+        (transport, result)
+    });
+    let _posted = server.next_post().await;
+
+    for id in 1..=3 {
+        let prefix = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"padding":""#);
+        let suffix = if id == 3 {
+            format!(r#"{SENTINEL}"}}}}"#)
+        } else {
+            r#""}}"#.to_owned()
+        };
+        let mut body = String::with_capacity(FRAME_BYTES);
+        body.push_str(&prefix);
+        body.push_str(&"x".repeat(FRAME_BYTES - prefix.len() - suffix.len()));
+        body.push_str(&suffix);
+        assert_eq!(body.len(), FRAME_BYTES);
+        server.send_message(&body);
+    }
+
+    let (transport, result) = tokio::time::timeout(Duration::from_secs(30), request)
+        .await
+        .expect("aggregate-budget rejection timed out")
+        .expect("request task panicked");
+    let diagnostic = result
+        .expect_err("third retained frame must exceed aggregate budget")
+        .to_string();
+    assert!(diagnostic.contains("aggregate budget"), "{diagnostic}");
+    assert!(diagnostic.contains(&SSE_AGGREGATE_LIMIT.to_string()));
+    assert!(!diagnostic.contains(SENTINEL), "{diagnostic}");
+    let shutdown = Box::new(transport)
+        .shutdown()
+        .await
+        .expect_err("latched aggregate failure must also fail shutdown");
+    assert!(shutdown.to_string().contains("aggregate budget"));
+    assert!(!shutdown.to_string().contains(SENTINEL));
 }

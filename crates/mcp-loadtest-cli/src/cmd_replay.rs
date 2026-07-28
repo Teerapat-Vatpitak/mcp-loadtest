@@ -27,8 +27,9 @@ use mcp_loadtest::trace::replay::replay_file;
 /// frame instead of hanging the whole replay.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Best-effort bound on the post-replay transport shutdown.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on the post-replay transport shutdown. This stays above stdio's
+/// composed internal kill/reap/pump budget.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Parsed CLI args for the subcommand.
 #[derive(Debug)]
@@ -57,14 +58,30 @@ pub(crate) struct ReplaySummary {
 }
 
 /// Run the `replay` subcommand: connect the target transport, replay the
-/// trace through it, shut the transport down (best-effort, bounded), and
+/// trace through it, shut the transport down (bounded and fail-closed), and
 /// return the summary for `main.rs` to print / gate on.
 pub(crate) async fn run(args: ReplayArgs) -> Result<ReplaySummary> {
     let mut transport = build_transport(&args).await?;
     let report = replay_file(&args.trace_file, transport.as_mut(), REQUEST_TIMEOUT)
         .await
-        .with_context(|| format!("replaying {}", args.trace_file.display()))?;
-    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, transport.shutdown()).await;
+        .with_context(|| format!("replaying {}", args.trace_file.display()));
+    let teardown = match tokio::time::timeout(SHUTDOWN_TIMEOUT, transport.shutdown()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(anyhow::anyhow!("replay target teardown failed: {error}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "replay target teardown exceeded {SHUTDOWN_TIMEOUT:?}"
+        )),
+    };
+    let report = match (report, teardown) {
+        (Ok(report), Ok(())) => report,
+        (Err(replay_error), Ok(())) => return Err(replay_error),
+        (Ok(_), Err(teardown_error)) => return Err(teardown_error),
+        (Err(replay_error), Err(teardown_error)) => {
+            return Err(anyhow::anyhow!(
+                "{replay_error}; additionally, {teardown_error}"
+            ));
+        }
+    };
 
     Ok(ReplaySummary {
         rendered: render(&report),

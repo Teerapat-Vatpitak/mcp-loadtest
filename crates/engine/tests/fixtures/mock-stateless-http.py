@@ -2,10 +2,9 @@
 """mock-stateless-http: MCP 2026-07-28 stateless server over Streamable HTTP.
 
 No initialize handshake: rejects `initialize` (-32600), answers
-`server/discover`, and REQUIRES the RC `_meta` block (with
-io.modelcontextprotocol/protocolVersion == 2026-07-28) on tools/* requests
-so a client that forgets `_meta` fails loudly. `--lazy-deadlock` makes every
-tools/call block forever (Vibe-Trading bug class, stateless edition).
+`server/discover`, and REQUIRES the 2026 request `_meta` plus
+MCP-Protocol-Version / Mcp-Method / Mcp-Name HTTP headers. `--lazy-deadlock`
+makes every tools/call block forever (Vibe-Trading bug class, stateless edition).
 Bind 127.0.0.1:<port>; print `LISTENING: 127.0.0.1:<port>`.
 """
 
@@ -34,23 +33,35 @@ def dispatch(msg):
         return err(msg_id, -32600, "stateless server: initialize was removed in 2026-07-28")
     if method == "server/discover":
         return {"jsonrpc": "2.0", "id": msg_id, "result": {
-            "protocolVersion": VERSION,
-            "protocolVersions": [VERSION],
+            "resultType": "complete",
+            "supportedVersions": [VERSION],
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "mock-stateless-http", "version": "0.0.0"},
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "mock-stateless-http", "version": "0.0.0",
+                },
+            },
+            "ttlMs": 0,
+            "cacheScope": "private",
         }}
     if method in ("tools/list", "tools/call"):
         meta = msg.get("params", {}).get("_meta", {})
         if meta.get(META_VERSION_KEY) != VERSION:
             return err(msg_id, -32600, f"missing/wrong _meta {META_VERSION_KEY}")
         if method == "tools/list":
-            return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": [
-                {"name": "echo", "description": "Echo args.", "inputSchema": {"type": "object"}},
-            ]}}
+            return {"jsonrpc": "2.0", "id": msg_id, "result": {
+                "resultType": "complete",
+                "ttlMs": 0,
+                "cacheScope": "private",
+                "tools": [
+                    {"name": "echo", "description": "Echo args.", "inputSchema": {"type": "object"}},
+                ],
+            }}
         if OPTS["lazy_deadlock"]:
             threading.Event().wait()  # hang this request forever
         args = msg.get("params", {}).get("arguments", {})
         return {"jsonrpc": "2.0", "id": msg_id, "result": {
+            "resultType": "complete",
             "content": [{"type": "text", "text": json.dumps(args)}]}}
     return err(msg_id, -32601, f"method not found: {method}")
 
@@ -64,6 +75,27 @@ class Handler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError):
             self.send_response(400)
             self.end_headers()
+            return
+        method = msg.get("method")
+        params = msg.get("params", {})
+        meta = params.get("_meta", {})
+        header_error = None
+        if self.headers.get("MCP-Protocol-Version") != VERSION:
+            header_error = "missing/wrong MCP-Protocol-Version"
+        elif meta.get(META_VERSION_KEY) != VERSION:
+            header_error = f"missing/wrong _meta {META_VERSION_KEY}"
+        elif self.headers.get("Mcp-Method") != method:
+            header_error = "missing/wrong Mcp-Method"
+        elif method == "tools/call" and self.headers.get("Mcp-Name") != params.get("name"):
+            header_error = "missing/wrong Mcp-Name"
+        if header_error:
+            response = err(msg.get("id"), -32020, header_error)
+            body = json.dumps(response).encode("utf-8")
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         response = dispatch(msg)
         if response is None:

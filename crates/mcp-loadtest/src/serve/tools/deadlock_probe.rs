@@ -21,7 +21,8 @@ pub(super) fn deadlock_probe_def() -> Value {
         "description":
             "Probe an MCP server for the Vibe-Trading-style deadlock bug class. \
              Spawns the target, fires N tool calls, and classifies each as \
-             success / hang / deadlock / error.",
+             success / hang / deadlock / error. Returns a fail-closed `passed` \
+             signal including worker and teardown completeness.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -101,11 +102,15 @@ pub(super) async fn deadlock_probe(args: &Value) -> Result<Value, ToolError> {
     let hung_for_ms = report.scenario_outcome.hung_for_ms.clone();
 
     Ok(json!({
+        "passed": report.passed(),
         "deadlock_count": report.scenario_outcome.deadlock_count,
         "hang_count": report.scenario_outcome.hang_count,
         "successful_calls": report.scenario_outcome.successful_calls,
         "total_calls": report.scenario_outcome.total_calls,
         "error_count": report.scenario_outcome.error_count,
+        "incomplete_worker_count": report.scenario_outcome.incomplete_worker_count,
+        "teardown_failure_count": report.scenario_outcome.teardown_failure_count,
+        "threshold_violation_count": report.threshold_violations.len(),
         "hung_for_ms": hung_for_ms,
         "scenario_outcome": {
             "notes": report.scenario_outcome.notes,

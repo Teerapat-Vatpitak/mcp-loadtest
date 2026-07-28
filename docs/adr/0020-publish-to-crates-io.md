@@ -1,7 +1,14 @@
 # 20. Publish to crates.io (supersedes 0015)
 
 Date: 2026-07-07
-Status: Proposed (user executes the publish)
+Status: Proposed, not approved or executed
+
+**Release-truth annotation (2026-07-28):** no crate has been published under
+this decision. [`docs/RELEASE.md`](../RELEASE.md) explicitly excludes
+crates.io from the `v0.1.0` distribution and defers it to a separate,
+irreversible maintainer decision. The floating `v1` force-move procedure in
+the original proposal is retired: exact release tags are immutable, and the
+release documentation recommends exact version or commit pins.
 
 Supersedes [0015](0015-defer-crates-io-distribution.md) once executed: the
 git-install and GitHub-Release-binary channels stay, crates.io is added as the
@@ -58,20 +65,12 @@ resolutions; existing `Cargo.lock`s still fetch them). Policy:
 - Yank the CLI and lib together when the defect is in the lib (the CLI is a
   thin wrapper and would otherwise keep resolving the bad lib).
 
-### GitHub Action versioning scheme
+### GitHub Action versioning scheme (historical proposal; not in force)
 
-The composite action (`action.yml`) is versioned by a **floating `v1` tag
-that tracks the latest `v0.x` release**, the standard Marketplace convention
-(`uses: Teerapat-Vatpitak/mcp-loadtest@v1`):
-
-- On every `v0.x.y` release the user force-moves `v1` to the same commit:
-  `git tag -f v1 v0.x.y && git push origin v1 --force` (a floating tag is the
-  one sanctioned force-push; the repo's force-push ban is about branches).
-- `v1` promises the action's **input/output contract** stays compatible even
-  while the underlying tool is 0.x. A breaking change to the action's
-  inputs/outputs starts a `v2` floating tag instead of moving `v1`.
-- Users who want reproducibility pin `@v0.x.y` (or a commit SHA); `@v1` is
-  the convenience default in docs.
+The original proposal considered a floating `v1` tag. It was not executed and
+is no longer the release procedure. Documentation uses immutable exact
+versions such as `@v0.1.0` (or a full commit SHA). Any future moving-major-tag
+policy requires a new explicit decision rather than reusing this proposal.
 
 ## Alternatives considered
 
@@ -122,7 +121,7 @@ cargo publish -p mcp-loadtest-cli
 #    - check the docs.rs build: https://docs.rs/mcp-loadtest
 #    - add crates.io + docs.rs badges and `cargo install mcp-loadtest-cli`
 #      to README's install section
-#    - move the floating action tag: git tag -f v1 v0.x.y && git push origin v1 --force
+#    - document the immutable exact Action tag; do not move or reuse tags
 ```
 
 ## Open questions

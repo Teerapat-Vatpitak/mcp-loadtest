@@ -5,8 +5,9 @@
 //! classify → respawn path runs (not the honest skip). Asserts the four
 //! invariants the plan pins: the harness never hangs, `total_calls` counts
 //! only sent payloads, the `Cancelled` bucket is never touched, and every raw
-//! send lands in a defined `FuzzClass` (mock-normal either errors-and-survives
-//! or dies on a given malformed frame — both are classified).
+//! send lands in a defined `FuzzClass` (mock-normal explicitly rejects invalid
+//! JSON, survives notifications, and exposes its deliberately permissive
+//! handling of some structurally invalid requests).
 
 mod helpers;
 
@@ -18,6 +19,8 @@ use mcp_loadtest_engine::scenario::{RunContext, Scenario};
 use mcp_loadtest_protocol::Session;
 use mcp_loadtest_protocol::SessionFactory;
 use tokio_util::sync::CancellationToken;
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A `RunContext` whose factory respawns fresh `mock-normal.py` sessions —
 /// this is what lets the fuzzer recover the connection each raw send poisons.
@@ -37,6 +40,13 @@ fn ctx_with_mock_normal_factory() -> RunContext {
         Duration::from_millis(700), // grace_period
     )
     .with_session_factory(factory)
+}
+
+async fn shutdown_cleanly(session: Session) {
+    tokio::time::timeout(SHUTDOWN_TIMEOUT, session.shutdown())
+        .await
+        .expect("fuzzer session shutdown timed out")
+        .expect("fuzzer session shutdown failed");
 }
 
 #[tokio::test]
@@ -98,30 +108,125 @@ async fn raw_payloads_against_mock_normal_are_classified_without_cancel_or_hang(
         "recorder must see every raw send: {snap:?}"
     );
 
-    // Every raw send is classified into error/deadlock (survive → ProtocolError,
-    // crash → Disconnected, wedge → Deadlock); a raw send is never counted as
-    // a plain success.
-    let classified = outcome.error_count + outcome.deadlock_count as u64;
+    // Every raw send is classified. A protocol-level rejection / live server
+    // is a successful fuzz probe, while crash and wedge remain failures.
+    let classified = outcome.successful_calls + outcome.error_count + outcome.deadlock_count as u64;
     assert_eq!(
         classified, outcome.total_calls,
         "every raw send must be classified: {outcome:?}"
     );
+    let healthy = snap.outcomes.success + snap.outcomes.expected_rejection;
     assert_eq!(
-        outcome.successful_calls, 0,
-        "a raw send is never a plain success: {outcome:?}"
+        outcome.successful_calls, healthy,
+        "clean survival and explicit protocol rejection are successful raw probes: {outcome:?}"
+    );
+    assert_eq!(
+        snap.outcomes.protocol_error, 0,
+        "expected fuzz handling must not be reported as a real protocol failure: {snap:?}"
+    );
+    assert_eq!(
+        snap.throughput.successful_requests, outcome.successful_calls,
+        "healthy raw-probe reactions count as successful fuzz requests: {snap:?}"
+    );
+    assert_eq!(
+        outcome.deadlock_count, 0,
+        "mock-normal explicitly rejects invalid JSON and must not wedge: {outcome:?}"
+    );
+    assert_eq!(
+        snap.outcomes.disconnected, 0,
+        "malformed JSON must not crash the normal fixture: {snap:?}"
+    );
+    assert!(
+        snap.outcomes.expected_rejection > 0,
+        "invalid JSON must produce an explicit JSON-RPC rejection: {snap:?}"
+    );
+    assert_eq!(
+        outcome.error_count,
+        snap.outcomes.disconnected + snap.outcomes.malformed + snap.outcomes.server_error,
+        "raw failures must reconcile to disconnect, malformed acceptance, or unexpected server error: {outcome:?}"
+    );
+    assert!(
+        snap.outcomes.malformed > 0,
+        "the deliberately permissive fixture must expose acceptance of at least one malformed raw request: {snap:?}"
     );
 
-    // The classified reactions must be exactly the healthy-survival and
-    // crash-disconnect buckets (mock-normal never deadlocks on these frames).
-    let survived = snap.outcomes.protocol_error;
-    let died = snap.outcomes.disconnected;
+    // The classified reactions split between healthy survival / explicit
+    // rejection and suspicious malformed acceptance. The reference fixture
+    // must neither crash nor wedge on these frames.
+    let survived = snap.outcomes.success + snap.outcomes.expected_rejection;
+    let accepted_badly = snap.outcomes.malformed + snap.outcomes.server_error;
     assert_eq!(
-        survived + died,
+        survived + accepted_badly,
         iterations as u64,
-        "reactions split between survived (ProtocolError) and died (Disconnected): {snap:?}"
+        "every raw reaction must land in one explicit bucket: {snap:?}"
     );
 
-    let _ = tokio::time::timeout(Duration::from_secs(5), session.shutdown()).await;
+    shutdown_cleanly(session).await;
+}
+
+#[tokio::test]
+async fn raw_wrong_jsonrpc_version_acceptance_fails_closed() {
+    let ctx = ctx_with_mock_normal_factory();
+    let mut session = ctx
+        .session_factory
+        .as_ref()
+        .expect("factory attached")
+        .spawn()
+        .await
+        .expect("initial spawn");
+    let fuzzer = Fuzzer {
+        iterations: 1,
+        seed: 1,
+        payloads: vec![FuzzPayload::WrongJsonRpcVersion],
+    };
+
+    let outcome = fuzzer.drive(&mut session, &ctx).await;
+    let snap = ctx.metrics.snapshot();
+    assert_eq!(outcome.total_calls, 1);
+    assert_eq!(outcome.successful_calls, 0);
+    assert_eq!(
+        outcome.error_count, 1,
+        "accepting a non-2.0 raw request must be an unexpected fuzz failure: {outcome:?}"
+    );
+    assert_eq!(snap.outcomes.malformed, 1);
+    assert!(
+        outcome
+            .notes
+            .iter()
+            .any(|note| note.contains("class=Accepted")),
+        "retained diagnostics must identify permissive acceptance: {outcome:?}"
+    );
+
+    shutdown_cleanly(session).await;
+}
+
+#[tokio::test]
+async fn raw_invalid_json_is_explicitly_rejected_without_crashing_fixture() {
+    let ctx = ctx_with_mock_normal_factory();
+    let mut session = ctx
+        .session_factory
+        .as_ref()
+        .expect("factory attached")
+        .spawn()
+        .await
+        .expect("initial spawn");
+    let fuzzer = Fuzzer {
+        iterations: 1,
+        seed: 1,
+        payloads: vec![FuzzPayload::InvalidJson],
+    };
+
+    let outcome = fuzzer.drive(&mut session, &ctx).await;
+    let snap = ctx.metrics.snapshot();
+    assert_eq!(outcome.total_calls, 1);
+    assert_eq!(outcome.successful_calls, 1);
+    assert_eq!(outcome.error_count, 0);
+    assert_eq!(outcome.deadlock_count, 0);
+    assert_eq!(snap.outcomes.expected_rejection, 1);
+    assert_eq!(snap.outcomes.disconnected, 0);
+    assert_eq!(snap.outcomes.deadlock, 0);
+
+    shutdown_cleanly(session).await;
 }
 
 #[tokio::test]
@@ -179,5 +284,5 @@ async fn raw_payloads_without_factory_are_skipped_not_sent() {
         "summary note must record all 8 iterations: {outcome:?}"
     );
 
-    let _ = tokio::time::timeout(Duration::from_secs(5), session.shutdown()).await;
+    shutdown_cleanly(session).await;
 }

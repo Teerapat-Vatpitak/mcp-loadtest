@@ -45,5 +45,8 @@ async fn session_tolerates_interleaved_notifications() {
         "echoed args should round-trip through the response, got: {rendered}"
     );
 
-    let _ = tokio::time::timeout(Duration::from_secs(5), session.shutdown()).await;
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("shutdown errored");
 }

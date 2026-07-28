@@ -54,6 +54,7 @@ where
     F: Future<Output = Result<CallToolResult, SessionError>>,
 {
     let start = Instant::now();
+    let deadlock_threshold = hang_threshold.saturating_add(grace_period);
 
     // Pin the future so we can poll it across two `select!` blocks.
     tokio::pin!(call_fut);
@@ -64,7 +65,17 @@ where
         res = &mut call_fut => {
             let duration = start.elapsed();
             return match res {
-                Ok(result) => HangOutcome::Ok { result, duration },
+                Ok(result) if duration < hang_threshold => {
+                    HangOutcome::Ok { result, duration }
+                }
+                Ok(_) if duration >= deadlock_threshold => {
+                    // A stalled executor can make the response future and
+                    // both watchdog timers ready in the same poll. The
+                    // future-first select must not turn an over-budget call
+                    // into a false-green success.
+                    HangOutcome::Deadlock { hung_for: duration }
+                }
+                Ok(result) => HangOutcome::Slow { result, duration },
                 Err(e) => HangOutcome::Err(e),
             };
         }
@@ -79,6 +90,9 @@ where
         res = &mut call_fut => {
             let duration = start.elapsed();
             match res {
+                Ok(_) if duration >= deadlock_threshold => {
+                    HangOutcome::Deadlock { hung_for: duration }
+                }
                 Ok(result) => HangOutcome::Slow { result, duration },
                 Err(e) => HangOutcome::Err(e),
             }
@@ -96,6 +110,7 @@ mod tests {
 
     fn ok_result() -> CallToolResult {
         CallToolResult {
+            meta: None,
             content: Vec::new(),
             is_error: false,
             structured_content: None,
@@ -141,6 +156,35 @@ mod tests {
             }
             other => panic!("expected HangOutcome::Slow, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn executor_stall_cannot_turn_an_over_threshold_call_into_ok() {
+        let fut = async {
+            // Simulate the runtime worker being unable to poll the watchdog
+            // while the call itself occupies that poll. When select resumes,
+            // both the threshold timer and this future are ready.
+            std::thread::sleep(Duration::from_millis(30));
+            Ok::<CallToolResult, SessionError>(ok_result())
+        };
+        let outcome = hang_detect(fut, Duration::from_millis(5), Duration::from_millis(100)).await;
+        assert!(
+            matches!(outcome, HangOutcome::Slow { .. }),
+            "elapsed wall time above the threshold must not be classified Ok: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_stall_past_grace_fails_closed_as_deadlock() {
+        let fut = async {
+            std::thread::sleep(Duration::from_millis(40));
+            Ok::<CallToolResult, SessionError>(ok_result())
+        };
+        let outcome = hang_detect(fut, Duration::from_millis(5), Duration::from_millis(10)).await;
+        assert!(
+            matches!(outcome, HangOutcome::Deadlock { .. }),
+            "elapsed wall time beyond threshold + grace must be a deadlock: {outcome:?}"
+        );
     }
 
     #[tokio::test]

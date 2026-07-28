@@ -41,7 +41,7 @@ use serde_json::{Value, json};
 use tokio::task::yield_now;
 
 use crate::scenario::pattern::{self, Pattern};
-use crate::scenario::{RunContext, Scenario, ScenarioOutcome, pool};
+use crate::scenario::{RunContext, Scenario, ScenarioOutcome, pool, teardown};
 use mcp_loadtest_protocol::Session;
 
 /// Sustained constant-load scenario.
@@ -73,14 +73,7 @@ impl Scenario for Sustained {
         // Legacy single-tool path: fold the (tool, args) pair into a one-step
         // pattern so the loop body stays uniform with the multi-pattern path.
         let patterns = vec![Pattern::single_call(self.tool.clone(), self.args.clone())];
-        if self.concurrent > 1 && ctx.session_factory.is_some() {
-            // Pooled path (M8). The borrowed `session` stays idle: it can't
-            // move into worker tasks and a borrowed "worker 0" special case
-            // buys no measurement — see module docs. Run::execute shuts the
-            // original session down as usual afterwards.
-            return drive_pooled_patterns(self.concurrent, self.duration, patterns, ctx).await;
-        }
-        run_loop(self.concurrent, self.duration, &patterns, session, ctx).await
+        run_patterns(self.concurrent, self.duration, &patterns, session, ctx).await
     }
 
     fn config_schema(&self) -> Value {
@@ -127,11 +120,10 @@ impl Scenario for Sustained {
 /// [`Pattern`] by weighted-random selection (see [`pattern::pick`]) and runs
 /// all of its steps with the pattern's configured think-time + error policy.
 ///
-/// `concurrent` and `duration` mirror [`Sustained`]'s knobs, but this entry
-/// point is **always sequential** on the provided session — the pooled path
-/// engages only via [`Sustained::drive`] for now (`ramp` and `spike` pool via
-/// `scenario::pool` as of M8's second slice; `PatternScenario` pooling
-/// follows in a later slice); `duration` bounds the total run.
+/// `concurrent` and `duration` mirror [`Sustained`]'s knobs. With a session
+/// factory and `concurrent > 1`, this uses the same real N-session pool as
+/// [`Sustained::drive`]; otherwise it drives the borrowed session
+/// sequentially and discloses an unmet concurrency request in the notes.
 ///
 /// Returns the same [`ScenarioOutcome`] shape as `drive`. Per-call metrics
 /// are recorded into `ctx.metrics` exactly the same way — every step in
@@ -143,13 +135,28 @@ pub(crate) async fn run_patterns(
     session: &mut Session,
     ctx: &RunContext,
 ) -> ScenarioOutcome {
+    if concurrent == 0 {
+        return invalid_plan("concurrent must be >= 1");
+    }
+    if duration.is_zero() {
+        return invalid_plan("duration must be > 0");
+    }
+    if concurrent > 1 && ctx.session_factory.is_some() {
+        // The borrowed `session` stays idle on the pooled path: it cannot be
+        // moved into `'static` worker tasks. Run::execute shuts it down after
+        // the scenario returns.
+        return drive_pooled_patterns(concurrent, duration, patterns.to_vec(), ctx).await;
+    }
     run_loop(concurrent, duration, patterns, session, ctx).await
 }
 
-/// Per-worker graceful-shutdown budget on the pooled path. Bounded so one
-/// wedged server can't stall the pool join; on timeout the dropped `Session`
-/// is reaped via `kill_on_drop` (same policy as `cold_start`).
-const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+fn invalid_plan(message: &str) -> ScenarioOutcome {
+    ScenarioOutcome {
+        error_count: 1,
+        notes: vec![format!("sustained: invalid plan — {message}")],
+        ..ScenarioOutcome::default()
+    }
+}
 
 /// Pooled path: spawn `workers` fresh sessions via the context's factory and
 /// run [`drive_until_deadline`] — the *same* loop body as the sequential
@@ -169,22 +176,9 @@ async fn drive_pooled_patterns(
     pool::drive_pooled(ctx, workers, move |_idx, mut session, worker_ctx| {
         let patterns = Arc::clone(&patterns);
         async move {
-            let outcome =
+            let mut outcome =
                 drive_until_deadline(deadline, &patterns, &mut session, &worker_ctx).await;
-            // Polite bounded teardown; on timeout the child is still reaped
-            // via kill_on_drop when `session` drops.
-            match tokio::time::timeout(WORKER_SHUTDOWN_TIMEOUT, session.shutdown()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "sustained: pooled worker shutdown errored");
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "sustained: pooled worker shutdown exceeded \
-                         {WORKER_SHUTDOWN_TIMEOUT:?}; child reaped via kill_on_drop"
-                    );
-                }
-            }
+            teardown::shutdown_session(session, &mut outcome, "sustained pooled worker").await;
             outcome
         }
     })

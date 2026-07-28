@@ -846,17 +846,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eventsource-stream"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74fef4569247a5f429d9156b9d0a2599914385dd189c539334c625d8099d90ab"
-dependencies = [
- "futures-core",
- "nom",
- "pin-project-lite",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1664,7 +1653,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-loadtest"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "mcp-loadtest-core",
  "mcp-loadtest-engine",
@@ -1677,7 +1666,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-loadtest-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1693,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-loadtest-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "hdrhistogram",
@@ -1703,11 +1692,12 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
+ "url",
 ]
 
 [[package]]
 name = "mcp-loadtest-engine"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "httpmock",
@@ -1726,7 +1716,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-loadtest-output"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "console 0.15.11",
  "crossterm",
@@ -1743,11 +1733,11 @@ dependencies = [
 
 [[package]]
 name = "mcp-loadtest-protocol"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "criterion",
- "eventsource-stream",
  "futures-util",
  "httpmock",
  "mcp-loadtest-core",

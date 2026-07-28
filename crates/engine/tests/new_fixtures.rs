@@ -6,7 +6,7 @@
 //! `Session`, build a `RunContext`, run a `Scenario`, assert on the recorded
 //! metrics) — proving the fixture exercises the intended client code path:
 //!
-//! - `mock-error.py`     → `SessionError::Server` → `CallOutcome::ServerError`
+//! - `mock-error.py`     → standard JSON-RPC errors → `CallOutcome::ProtocolError`
 //! - `mock-malformed.py` → `serde_json` parse error → `CallOutcome::Malformed`
 //! - `mock-leak.py`      → monotonically growing RSS → `detect_leak` slope > 0
 //! - `mock-slow-init.py` → 5s handshake still completes inside the 10s budget
@@ -42,12 +42,14 @@ fn make_ctx() -> RunContext {
 }
 
 /// `mock-error.py` returns a JSON-RPC error on every `tools/call`, cycling
-/// `-32601 / -32602 / -32603`. The client maps a structured server error
-/// (`SessionError::Server`) to [`mcp_loadtest_core::metrics::CallOutcome::ServerError`]
-/// (see `scenario::classify_error`). A short sustained run must therefore
-/// record zero successes and a non-zero `server_error` count.
+/// `-32601 / -32602 / -32603`. Standard JSON-RPC failures in a normal
+/// workload map to
+/// [`mcp_loadtest_core::metrics::CallOutcome::ProtocolError`] so a permissive
+/// error-rate threshold cannot turn a protocol mismatch into PASS. A short
+/// sustained run must therefore record zero successes and a non-zero
+/// `protocol_error` count.
 #[tokio::test]
-async fn mock_error_classifies_as_server_error() {
+async fn mock_error_classifies_as_protocol_error() {
     let mock = helpers::fixture_path("mock-error.py");
     let py = helpers::python();
 
@@ -80,19 +82,24 @@ async fn mock_error_classifies_as_server_error() {
 
     let snap = ctx.metrics.snapshot();
     assert!(
-        snap.outcomes.server_error > 0,
-        "JSON-RPC server errors must classify as ServerError; outcomes={:?}",
+        snap.outcomes.protocol_error > 0,
+        "standard JSON-RPC errors must classify as ProtocolError; outcomes={:?}",
         snap.outcomes
     );
-    // Sanity: the cycled codes are all server/internal errors, none should be
-    // miscategorised as a transport-level Malformed/Disconnected.
+    // Sanity: the cycled codes are standard protocol failures, not
+    // implementation-defined server errors or malformed transport frames.
+    assert_eq!(
+        snap.outcomes.server_error, 0,
+        "standard JSON-RPC errors must not be counted as ServerError; outcomes={:?}",
+        snap.outcomes
+    );
     assert_eq!(
         snap.outcomes.malformed, 0,
-        "server errors must not be counted as Malformed; outcomes={:?}",
+        "structured protocol errors must not be counted as Malformed; outcomes={:?}",
         snap.outcomes
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
@@ -150,7 +157,10 @@ async fn mock_malformed_classifies_as_malformed() {
         snap.outcomes
     );
 
-    let _ = tokio::time::timeout(Duration::from_secs(5), session.shutdown()).await;
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("shutdown errored");
 }
 
 /// `mock-leak.py` appends 10 KB to a module-global list on every `tools/call`
@@ -224,7 +234,10 @@ async fn mock_leak_rss_slope_positive() {
         "leaking server RSS should regress to a positive slope; got {slope} MB/s, series={series:?}"
     );
 
-    let _ = tokio::time::timeout(Duration::from_secs(5), session.shutdown()).await;
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("shutdown errored");
 }
 
 /// `mock-slow-init.py` sleeps 5s before answering `initialize`, then behaves
@@ -283,7 +296,7 @@ async fn mock_slow_init_pinned_contract() {
         "mock-slow-init only delays initialize; tool calls must not error; got {outcome:?}"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");

@@ -1,0 +1,519 @@
+name: Action contract
+
+on:
+  workflow_call:
+    inputs:
+      source-ref:
+        description: Exact commit to test when invoked as a release gate.
+        required: false
+        type: string
+        default: ""
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  args:
+    name: args (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
+      - name: Verify requested source revision
+        if: inputs.source-ref != ''
+        shell: bash
+        env:
+          APPROVED_SHA: ${{ inputs.source-ref }}
+        run: test "$(git rev-parse HEAD)" = "$APPROVED_SHA"
+      - name: Verify data-only argument parsing
+        shell: bash
+        run: bash scripts/test-action-args.sh
+
+  composite:
+    name: composite action end-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
+      - name: Verify requested source revision
+        if: inputs.source-ref != ''
+        shell: bash
+        env:
+          APPROVED_SHA: ${{ inputs.source-ref }}
+        run: test "$(git rev-parse HEAD)" = "$APPROVED_SHA"
+
+      # Build a local release-asset fixture and intercept only this job's
+      # download. The composite action still executes its real install,
+      # checksum, unpack, argv, report-discovery, compare, and exit gates;
+      # production action.yml has no skip-install or test bypass.
+      - name: Prepare local release fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset_root="${RUNNER_TEMP}/action-contract-assets"
+          package_root="${RUNNER_TEMP}/action-contract-package"
+          shim_root="${RUNNER_TEMP}/action-contract-shims"
+          package_name="mcp-loadtest-v0.1.0-x86_64-unknown-linux-gnu"
+          asset_name="${package_name}.tar.gz"
+          mkdir -p \
+            "${asset_root}" \
+            "${package_root}/${package_name}" \
+            "${shim_root}" \
+            ".action-contract/success/custom reports/01J00000000000000000000000" \
+            ".action-contract/failure" \
+            ".action-contract/foreign/foreign reports" \
+            ".action-contract/run"
+
+          cat > "${package_root}/${package_name}/mcp-loadtest" <<'FIXTURE'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          capture="${MCP_LOADTEST_FIXTURE_CAPTURE:?missing fixture capture path}"
+          run_id="${MCP_LOADTEST_FIXTURE_RUN_ID:?missing fixture run id}"
+          command_name="${1-}"
+
+          case "${command_name}" in
+            deadlock-probe|run|cross|doctor)
+              case " $* " in
+                *" --action-redact-server-identity "*) ;;
+                *) echo "missing Action redaction flag" >&2; exit 65 ;;
+              esac
+              ;;
+          esac
+
+          python3 - "${capture}.${command_name}.json" "$@" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          values = sys.argv[2:]
+          captured = []
+          index = 0
+          while index < len(values):
+              value = values[index]
+              if value == "--server" and index + 1 < len(values):
+                  captured.extend(["--server", "[REDACTED]"])
+                  index += 2
+              elif value.startswith("--server="):
+                  captured.append("--server=[REDACTED]")
+                  index += 1
+              else:
+                  captured.append(value)
+                  index += 1
+          pathlib.Path(sys.argv[1]).write_text(
+              json.dumps(captured, ensure_ascii=False),
+              encoding="utf-8",
+          )
+          PY
+
+          case "${command_name}" in
+            deadlock-probe|run|cross)
+              shift
+              output_dir=""
+              while [ "$#" -gt 0 ]; do
+                case "$1" in
+                  --output-dir|--action-output-dir)
+                    [ "$#" -ge 2 ] || exit 64
+                    output_dir="$2"
+                    shift 2
+                    ;;
+                  --output-dir=*|--action-output-dir=*)
+                    output_dir="${1#*=}"
+                    shift
+                    ;;
+                  *)
+                    shift
+                    ;;
+                esac
+              done
+              [ -n "$output_dir" ] || exit 64
+              foreign_pid=""
+              if [ -n "${MCP_LOADTEST_FIXTURE_FOREIGN_ROOT:-}" ]; then
+                (
+                  mkdir -p "${MCP_LOADTEST_FIXTURE_FOREIGN_ROOT}/${run_id}"
+                  printf '{"run_id":"%s"}\n' "$run_id" \
+                    > "${MCP_LOADTEST_FIXTURE_FOREIGN_ROOT}/${run_id}/metrics.json"
+                ) &
+                foreign_pid="$!"
+              fi
+              if [ "${MCP_LOADTEST_FIXTURE_SKIP_REPORT:-false}" != "true" ]; then
+                mkdir -p "${output_dir}/${run_id}"
+                printf '{"run_id":"%s","server":{"command":"[REDACTED]","args":[]}}\n' \
+                  "$run_id" > "${output_dir}/${run_id}/metrics.json"
+                printf '# fixture report\n\nServer: `[REDACTED]`\n' \
+                  > "${output_dir}/${run_id}/report.md"
+              fi
+              if [ -n "$foreign_pid" ]; then
+                wait "$foreign_pid"
+              fi
+              printf 'server: [REDACTED]\n'
+              exit "${MCP_LOADTEST_FIXTURE_EXIT:-0}"
+              ;;
+            doctor)
+              printf 'server initialize smoke: ok (identity redacted)\n'
+              ;;
+            compare)
+              printf '# fixture comparison\n\nNo regression.\n'
+              ;;
+            *)
+              echo "unexpected fixture command" >&2
+              exit 64
+              ;;
+          esac
+          FIXTURE
+          chmod +x "${package_root}/${package_name}/mcp-loadtest"
+
+          tar -czf "${asset_root}/${asset_name}" -C "${package_root}" "${package_name}"
+          (
+            cd "${asset_root}"
+            sha256sum "${asset_name}" > "${asset_name}.sha256"
+          )
+
+          cat > "${shim_root}/curl" <<'CURL_SHIM'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          output=""
+          url=""
+          while [ "$#" -gt 0 ]; do
+            case "$1" in
+              -o)
+                output="$2"
+                shift 2
+                ;;
+              --retry|-H)
+                shift 2
+                ;;
+              -*)
+                shift
+                ;;
+              *)
+                url="$1"
+                shift
+                ;;
+            esac
+          done
+          [ -n "$output" ] && [ -n "$url" ]
+          cp "${MCP_LOADTEST_TEST_ASSET_DIR}/${url##*/}" "$output"
+          CURL_SHIM
+          chmod +x "${shim_root}/curl"
+
+          printf '{}\n' > ".action-contract/success/baseline.json"
+          printf '[server]\ncommand = "python"\nargs = ["-m","fake","ACTION_SERVER_SECRET_7F3B"]\n\n[output]\nreport_dir = "./caller-runs"\n' \
+            > ".action-contract/run/action.toml"
+          echo "MCP_LOADTEST_TEST_ASSET_DIR=${asset_root}" >> "$GITHUB_ENV"
+          echo "${shim_root}" >> "$GITHUB_PATH"
+
+      - name: Exercise safe argv, current report, and baseline
+        id: success
+        uses: ./
+        env:
+          MCP_LOADTEST_FIXTURE_CAPTURE: ${{ runner.temp }}/action-success
+          MCP_LOADTEST_FIXTURE_RUN_ID: 01J00000000000000000000001
+        with:
+          server: "python -m fake_server --token ACTION_SERVER_SECRET_7F3B"
+          working-directory: .action-contract/success
+          args: '["--tool","echo value","--args","{\"payload\":\"$(touch action-contract-injected); ::error::data\"}"]'
+          baseline: baseline.json
+
+      - name: Verify success outputs and literal argv
+        shell: bash
+        env:
+          ACTION_PASSED: ${{ steps.success.outputs.passed }}
+          ACTION_REPORT_DIR: ${{ steps.success.outputs.report-dir }}
+          CAPTURE_ROOT: ${{ runner.temp }}/action-success
+          EXPECTED_RUN_ID: 01J00000000000000000000001
+          SECRET_SENTINEL: ACTION_SERVER_SECRET_7F3B
+        run: |
+          set -euo pipefail
+          [ "${ACTION_PASSED}" = "true" ]
+          case "${ACTION_REPORT_DIR}" in
+            "${RUNNER_TEMP}"/mcp-loadtest-action-runs.*/"${EXPECTED_RUN_ID}") ;;
+            *) echo "unexpected Action-owned report path: ${ACTION_REPORT_DIR}" >&2; exit 1 ;;
+          esac
+          [ ! -e ".action-contract/success/action-contract-injected" ]
+          [ -d ".action-contract/success/custom reports/01J00000000000000000000000" ]
+          python3 - "${CAPTURE_ROOT}" "${ACTION_REPORT_DIR}" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          report_dir = pathlib.Path(sys.argv[2])
+          action_root = str(report_dir.parent)
+          main = json.loads(root.with_suffix(".deadlock-probe.json").read_text())
+          assert main == [
+              "deadlock-probe",
+              "--server",
+              "[REDACTED]",
+              "--tool",
+              "echo value",
+              "--args",
+              '{"payload":"$(touch action-contract-injected); ::error::data"}',
+              "--output-dir",
+              action_root,
+              "--action-redact-server-identity",
+          ], main
+          compare = json.loads(root.with_suffix(".compare.json").read_text())
+          assert compare == [
+              "compare",
+              "baseline.json",
+              str(report_dir / "metrics.json"),
+              "--format",
+              "markdown",
+          ], compare
+          PY
+          if grep -R -F "${SECRET_SENTINEL}" \
+            "${ACTION_REPORT_DIR}" \
+            "${CAPTURE_ROOT}.deadlock-probe.json" \
+            "${CAPTURE_ROOT}.compare.json"
+          then
+            echo "Action artifacts or captured argv leaked the server sentinel" >&2
+            exit 1
+          fi
+
+      - name: Exercise main-command failure gate
+        id: failure
+        continue-on-error: true
+        uses: ./
+        env:
+          MCP_LOADTEST_FIXTURE_CAPTURE: ${{ runner.temp }}/action-failure
+          MCP_LOADTEST_FIXTURE_RUN_ID: 01J00000000000000000000002
+          MCP_LOADTEST_FIXTURE_EXIT: "7"
+        with:
+          server: python -m failing_server
+          working-directory: .action-contract/failure
+          args: "[]"
+
+      - name: Verify failed action cannot report green
+        shell: bash
+        env:
+          ACTION_OUTCOME: ${{ steps.failure.outcome }}
+          ACTION_PASSED: ${{ steps.failure.outputs.passed }}
+          ACTION_REPORT_DIR: ${{ steps.failure.outputs.report-dir }}
+        run: |
+          set -euo pipefail
+          [ "${ACTION_OUTCOME}" = "failure" ]
+          [ "${ACTION_PASSED}" = "false" ]
+          case "${ACTION_REPORT_DIR}" in
+            "${RUNNER_TEMP}"/mcp-loadtest-action-runs.*/01J00000000000000000000002) ;;
+            *) echo "unexpected failed-report path: ${ACTION_REPORT_DIR}" >&2; exit 1 ;;
+          esac
+
+      - name: Reject baseline for a no-report command
+        id: doctor_baseline
+        continue-on-error: true
+        uses: ./
+        env:
+          MCP_LOADTEST_FIXTURE_CAPTURE: ${{ runner.temp }}/action-doctor
+          MCP_LOADTEST_FIXTURE_RUN_ID: 01J00000000000000000000003
+        with:
+          command: doctor
+          server: python -m fake_server
+          working-directory: .action-contract/success
+          baseline: baseline.json
+
+      - name: Verify doctor baseline failed closed before invocation
+        shell: bash
+        env:
+          ACTION_OUTCOME: ${{ steps.doctor_baseline.outcome }}
+          ACTION_PASSED: ${{ steps.doctor_baseline.outputs.passed }}
+          CAPTURE_ROOT: ${{ runner.temp }}/action-doctor
+        run: |
+          set -euo pipefail
+          [ "${ACTION_OUTCOME}" = "failure" ]
+          [ "${ACTION_PASSED}" = "false" ]
+          [ ! -e "${CAPTURE_ROOT}.doctor.json" ]
+
+      - name: Reject multiline invalid command
+        id: invalid_command
+        continue-on-error: true
+        uses: ./
+        with:
+          command: |-
+            invalid
+            ::warning::caller-controlled-workflow-command
+          server: python -m fake_server
+          working-directory: .action-contract/success
+
+      - name: Verify invalid command outputs fail closed
+        shell: bash
+        env:
+          ACTION_OUTCOME: ${{ steps.invalid_command.outcome }}
+          ACTION_PASSED: ${{ steps.invalid_command.outputs.passed }}
+          ACTION_REPORT_DIR: ${{ steps.invalid_command.outputs.report-dir }}
+        run: |
+          set -euo pipefail
+          [ "${ACTION_OUTCOME}" = "failure" ]
+          [ "${ACTION_PASSED}" = "false" ]
+          [ -z "${ACTION_REPORT_DIR}" ]
+
+      - name: Reject invalid JSON argument types
+        id: invalid_args
+        continue-on-error: true
+        uses: ./
+        with:
+          server: python -m fake_server
+          working-directory: .action-contract/success
+          args: '["--tool",3]'
+
+      - name: Verify invalid args outputs fail closed
+        shell: bash
+        env:
+          ACTION_OUTCOME: ${{ steps.invalid_args.outcome }}
+          ACTION_PASSED: ${{ steps.invalid_args.outputs.passed }}
+          ACTION_REPORT_DIR: ${{ steps.invalid_args.outputs.report-dir }}
+        run: |
+          set -euo pipefail
+          [ "${ACTION_OUTCOME}" = "failure" ]
+          [ "${ACTION_PASSED}" = "false" ]
+          [ -z "${ACTION_REPORT_DIR}" ]
+
+      - name: Exercise foreign report race
+        id: foreign_report
+        continue-on-error: true
+        uses: ./
+        env:
+          MCP_LOADTEST_FIXTURE_CAPTURE: ${{ runner.temp }}/action-foreign
+          MCP_LOADTEST_FIXTURE_RUN_ID: 01J00000000000000000000004
+          MCP_LOADTEST_FIXTURE_SKIP_REPORT: "true"
+          MCP_LOADTEST_FIXTURE_FOREIGN_ROOT: ${{ github.workspace }}/.action-contract/foreign/foreign reports
+        with:
+          server: python -m fake_server
+          working-directory: .action-contract/foreign
+
+      - name: Verify foreign report cannot be attributed
+        shell: bash
+        env:
+          ACTION_OUTCOME: ${{ steps.foreign_report.outcome }}
+          ACTION_PASSED: ${{ steps.foreign_report.outputs.passed }}
+          ACTION_REPORT_DIR: ${{ steps.foreign_report.outputs.report-dir }}
+        run: |
+          set -euo pipefail
+          [ "${ACTION_OUTCOME}" = "failure" ]
+          [ "${ACTION_PASSED}" = "false" ]
+          [ -z "${ACTION_REPORT_DIR}" ]
+          test -f \
+            ".action-contract/foreign/foreign reports/01J00000000000000000000004/metrics.json"
+
+      - name: Exercise private run output override
+        id: run_output
+        uses: ./
+        env:
+          MCP_LOADTEST_FIXTURE_CAPTURE: ${{ runner.temp }}/action-run
+          MCP_LOADTEST_FIXTURE_RUN_ID: 01J00000000000000000000005
+        with:
+          command: run
+          server: unused-for-run
+          working-directory: .action-contract/run
+          args: '["--config","action.toml"]'
+
+      - name: Verify run received only the Action-owned output root
+        shell: bash
+        env:
+          ACTION_PASSED: ${{ steps.run_output.outputs.passed }}
+          ACTION_REPORT_DIR: ${{ steps.run_output.outputs.report-dir }}
+          CAPTURE_ROOT: ${{ runner.temp }}/action-run
+          SECRET_SENTINEL: ACTION_SERVER_SECRET_7F3B
+        run: |
+          set -euo pipefail
+          [ "${ACTION_PASSED}" = "true" ]
+          case "${ACTION_REPORT_DIR}" in
+            "${RUNNER_TEMP}"/mcp-loadtest-action-runs.*/01J00000000000000000000005) ;;
+            *) echo "unexpected run report path: ${ACTION_REPORT_DIR}" >&2; exit 1 ;;
+          esac
+          [ ! -e ".action-contract/run/caller-runs" ]
+          python3 - "${CAPTURE_ROOT}" "${ACTION_REPORT_DIR}" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          capture = pathlib.Path(sys.argv[1]).with_suffix(".run.json")
+          action_root = str(pathlib.Path(sys.argv[2]).parent)
+          argv = json.loads(capture.read_text())
+          assert argv == [
+              "run",
+              "--config",
+              "action.toml",
+              "--action-output-dir",
+              action_root,
+              "--action-redact-server-identity",
+          ], argv
+          PY
+          if grep -R -F "${SECRET_SENTINEL}" \
+            "${ACTION_REPORT_DIR}" \
+            "${CAPTURE_ROOT}.run.json"
+          then
+            echo "run output leaked the config server sentinel" >&2
+            exit 1
+          fi
+
+      - name: Exercise redacted cross output
+        id: redacted_cross
+        uses: ./
+        env:
+          MCP_LOADTEST_FIXTURE_CAPTURE: ${{ runner.temp }}/action-cross
+          MCP_LOADTEST_FIXTURE_RUN_ID: 01J00000000000000000000006
+        with:
+          command: cross
+          server: python -m fake_server --token ACTION_SERVER_SECRET_7F3B
+          working-directory: .action-contract/success
+
+      - name: Verify cross output omits server identity
+        shell: bash
+        env:
+          ACTION_PASSED: ${{ steps.redacted_cross.outputs.passed }}
+          ACTION_REPORT_DIR: ${{ steps.redacted_cross.outputs.report-dir }}
+          CAPTURE_ROOT: ${{ runner.temp }}/action-cross
+          SECRET_SENTINEL: ACTION_SERVER_SECRET_7F3B
+        run: |
+          set -euo pipefail
+          [ "${ACTION_PASSED}" = "true" ]
+          case "${ACTION_REPORT_DIR}" in
+            "${RUNNER_TEMP}"/mcp-loadtest-action-runs.*) ;;
+            *) echo "unexpected cross report root: ${ACTION_REPORT_DIR}" >&2; exit 1 ;;
+          esac
+          test -f \
+            "${ACTION_REPORT_DIR}/01J00000000000000000000006/metrics.json"
+          if grep -R -F "${SECRET_SENTINEL}" \
+            "${ACTION_REPORT_DIR}" \
+            "${CAPTURE_ROOT}.cross.json"
+          then
+            echo "cross output leaked the server sentinel" >&2
+            exit 1
+          fi
+
+      - name: Exercise redacted doctor output
+        id: redacted_doctor
+        uses: ./
+        env:
+          MCP_LOADTEST_FIXTURE_CAPTURE: ${{ runner.temp }}/action-doctor-redacted
+          MCP_LOADTEST_FIXTURE_RUN_ID: 01J00000000000000000000007
+        with:
+          command: doctor
+          server: python -m fake_server --token ACTION_SERVER_SECRET_7F3B
+          working-directory: .action-contract/success
+
+      - name: Verify doctor output omits server identity
+        shell: bash
+        env:
+          ACTION_PASSED: ${{ steps.redacted_doctor.outputs.passed }}
+          ACTION_REPORT_DIR: ${{ steps.redacted_doctor.outputs.report-dir }}
+          CAPTURE_ROOT: ${{ runner.temp }}/action-doctor-redacted
+          SECRET_SENTINEL: ACTION_SERVER_SECRET_7F3B
+        run: |
+          set -euo pipefail
+          [ "${ACTION_PASSED}" = "true" ]
+          [ -z "${ACTION_REPORT_DIR}" ]
+          if grep -F "${SECRET_SENTINEL}" "${CAPTURE_ROOT}.doctor.json"; then
+            echo "doctor captured argv leaked the server sentinel" >&2
+            exit 1
+          fi

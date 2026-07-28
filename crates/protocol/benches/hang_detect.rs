@@ -26,6 +26,7 @@ use tokio::runtime::Runtime;
 
 fn empty_result() -> CallToolResult {
     CallToolResult {
+        meta: None,
         content: Vec::new(),
         is_error: false,
         structured_content: None,

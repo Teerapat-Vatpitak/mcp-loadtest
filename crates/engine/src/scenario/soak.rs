@@ -94,6 +94,24 @@ impl Default for Soak {
 #[async_trait]
 impl Scenario for Soak {
     async fn drive(&self, session: &mut Session, ctx: &RunContext) -> ScenarioOutcome {
+        if self.concurrent != 1 {
+            return invalid_plan(
+                "concurrent must be 1; soak sampling is single-session today \
+                 (use sustained for pooled concurrency)",
+            );
+        }
+        if self.duration.is_zero() {
+            return invalid_plan("duration must be > 0");
+        }
+        if self.sample_interval.is_zero() {
+            // Without this guard `next_sample += sample_interval` never
+            // advances and the sampling catch-up loop spins forever.
+            return invalid_plan("sample_interval must be > 0");
+        }
+        if !self.latency_drift_ms_per_sec.is_finite() || self.latency_drift_ms_per_sec < 0.0 {
+            return invalid_plan("latency_drift_ms_per_sec must be finite and >= 0");
+        }
+
         let mut total_calls: u64 = 0;
         let mut successful_calls: u64 = 0;
         let mut error_count: u64 = 0;
@@ -103,14 +121,6 @@ impl Scenario for Soak {
         let mut next_sample = start + self.sample_interval;
         let mut samples: Vec<(Duration, ScenarioMetrics)> = Vec::new();
         let mut notes = Vec::new();
-
-        if self.concurrent > 1 {
-            notes.push(format!(
-                "soak: M5 runs sequentially on one session; concurrent={} \
-                 is recorded but not multiplexed",
-                self.concurrent
-            ));
-        }
 
         loop {
             if ctx.is_cancelled() {
@@ -150,10 +160,15 @@ impl Scenario for Soak {
             let elapsed = call_start.elapsed();
             total_calls += 1;
             match result {
-                Ok(_) => {
-                    successful_calls += 1;
-                    ctx.metrics
-                        .record_tool(&self.tool, elapsed, CallOutcome::Success);
+                Ok(result) => {
+                    let kind = if super::is_logical_tool_error(&result) {
+                        error_count += 1;
+                        CallOutcome::ServerError
+                    } else {
+                        successful_calls += 1;
+                        CallOutcome::Success
+                    };
+                    ctx.metrics.record_tool(&self.tool, elapsed, kind);
                 }
                 Err(err) => {
                     error_count += 1;
@@ -240,6 +255,9 @@ impl Scenario for Soak {
             hang_count: 0,
             deadlock_count: 0,
             error_count,
+            divergence_count: 0,
+            incomplete_worker_count: 0,
+            teardown_failure_count: 0,
             notes,
             hung_for_ms: Vec::new(),
         }
@@ -255,7 +273,8 @@ impl Scenario for Soak {
                 "concurrent": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Target concurrency (M5: serialized on one session, like Sustained)."
+                    "maximum": 1,
+                    "description": "Soak currently supports one session so periodic samples remain attributable. Use sustained for pooled concurrency."
                 },
                 "duration": {
                     "type": "string",
@@ -285,5 +304,13 @@ impl Scenario for Soak {
 
     fn name(&self) -> &'static str {
         "soak"
+    }
+}
+
+fn invalid_plan(message: &str) -> ScenarioOutcome {
+    ScenarioOutcome {
+        error_count: 1,
+        notes: vec![format!("soak: invalid plan — {message}")],
+        ..ScenarioOutcome::default()
     }
 }

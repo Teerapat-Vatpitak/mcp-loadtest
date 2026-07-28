@@ -34,6 +34,9 @@ use serde_json::json;
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Configured budget under test — well below the 3s init sleep.
 const BUDGET: Duration = Duration::from_millis(500);
+/// Long enough for a contended Python spawn, but finite while tools/list
+/// deliberately withholds its response.
+const DISCOVERY_BUDGET: Duration = Duration::from_secs(3);
 
 /// A stdlib-only MCP server that sleeps 3s on `initialize`, then behaves
 /// normally. Passed via `python -c`, so there is no fixture-file dependency.
@@ -66,6 +69,40 @@ while True:
         args = msg.get("params", {}).get("arguments", {})
         send({"jsonrpc":"2.0","id":mid,"result":{
             "content":[{"type":"text","text":json.dumps(args)}]}})
+    elif mid is not None:
+        send({"jsonrpc":"2.0","id":mid,"error":{"code":-32601,"message":"method not found"}})
+"#
+    .to_string()
+}
+
+/// Initializes successfully, records proof that the handshake completed, then
+/// deliberately withholds tools/list while continuing to read stdin. Closing
+/// stdin during timeout cleanup therefore lets the process exit immediately.
+fn no_tools_list_response_server() -> String {
+    r#"
+import sys, json, os
+marker = sys.argv[1]
+def send(o):
+    sys.stdout.write(json.dumps(o) + "\n")
+    sys.stdout.flush()
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if method == "initialize":
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+        send({"jsonrpc":"2.0","id":mid,"result":{
+            "protocolVersion":"2025-03-26",
+            "capabilities":{"tools":{}},
+            "serverInfo":{"name":"no-list","version":"0.0.0"}}})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        pass
     elif mid is not None:
         send({"jsonrpc":"2.0","id":mid,"error":{"code":-32601,"message":"method not found"}})
 "#
@@ -175,5 +212,101 @@ async fn spawn_with_timeout_enforces_budget() {
             "expected StartupTimeout(500ms), got {:?}",
             other.map(|_| "<ready session>")
         ),
+    }
+}
+
+#[tokio::test]
+async fn startup_timeout_includes_required_tools_list_and_cleans_up() {
+    let py = helpers::python();
+    let script = no_tools_list_response_server();
+    let dir = ScratchDir::new("tools-list");
+    let marker = dir.path().join("initialized.pid");
+    let marker_arg = marker.to_string_lossy();
+    let toml = format!(
+        r#"
+        [server]
+        transport = "stdio"
+        command = {py:?}
+        args = ["-c", {script:?}, {marker_arg:?}]
+        startup_timeout = "3s"
+        [scenario]
+        type = "sustained"
+        duration = "1s"
+        concurrent = 1
+        tool = "echo"
+        "#
+    );
+    let config = Config::from_toml_str(&toml).expect("config must parse");
+    let scenario: Box<dyn Scenario> = Box::new(Sustained {
+        concurrent: 1,
+        duration: Duration::from_secs(1),
+        tool: "echo".to_owned(),
+        args: json!({}),
+    });
+    let run = mcp_loadtest_engine::Run::new(config, scenario, dir.path());
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, run.execute())
+        .await
+        .expect("tools/list startup timeout hung");
+    assert!(
+        marker.exists(),
+        "fixture must prove initialize completed before tools/list stalled"
+    );
+    match result {
+        Err(RunError::Session(SessionError::StartupTimeout(budget))) => {
+            assert_eq!(budget, DISCOVERY_BUDGET);
+        }
+        other => panic!("expected tools/list StartupTimeout(3s), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn startup_timeout_bounds_sse_headers_stall() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled SSE peer");
+    let addr = listener.local_addr().expect("listener address");
+    let peer = tokio::spawn(async move {
+        let Ok((_socket, _)) = listener.accept().await else {
+            return;
+        };
+        std::future::pending::<()>().await;
+    });
+
+    let toml = format!(
+        r#"
+        [server]
+        transport = "sse"
+        url = "http://{addr}/events"
+        allowed_hosts = ["127.0.0.1"]
+        startup_timeout = "500ms"
+        [scenario]
+        type = "sustained"
+        duration = "1s"
+        concurrent = 1
+        tool = "echo"
+        "#
+    );
+    let config = Config::from_toml_str(&toml).expect("config must parse");
+    let dir = ScratchDir::new("sse-headers");
+    let scenario: Box<dyn Scenario> = Box::new(Sustained {
+        concurrent: 1,
+        duration: Duration::from_secs(1),
+        tool: "echo".to_owned(),
+        args: json!({}),
+    });
+    let run = mcp_loadtest_engine::Run::new(config, scenario, dir.path());
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, run.execute())
+        .await
+        .expect("SSE header stall escaped startup timeout");
+    peer.abort();
+    let _ = peer.await;
+
+    match result {
+        Err(RunError::Session(SessionError::StartupTimeout(budget))) => {
+            assert_eq!(budget, BUDGET);
+        }
+        other => panic!("expected SSE-connect StartupTimeout(500ms), got {other:?}"),
     }
 }

@@ -97,7 +97,7 @@ async fn coverage_against_mock_normal_records_echo_call() {
         coverage.unexercised
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");

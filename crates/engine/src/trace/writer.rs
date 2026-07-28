@@ -10,12 +10,12 @@
 //! microseconds), the lock is held for exactly one line, and the fully-async
 //! alternative — a channel plus dedicated writer task — can silently lose
 //! tail frames when the process aborts, which for a debugging artifact is
-//! worse than the micro-stall. Recording failures never fail the run: the
-//! writer warns once (via `tracing`) and drops subsequent failing frames.
+//! worse than the micro-stall. Per-frame calls cannot return an I/O error
+//! through the `Transport` decorator, so the writer latches the first failure,
+//! warns once, and [`TraceWriter::finish`] fails the explicitly traced run.
 
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -26,18 +26,29 @@ use mcp_loadtest_protocol::transport::{Transport, TransportError};
 use super::TraceError;
 use super::format::{self, Direction, TraceFrame, TraceHeader};
 
+struct LatchedFailure {
+    kind: std::io::ErrorKind,
+    message: String,
+}
+
+struct WriterState {
+    sink: Box<dyn Write + Send>,
+    failure: Option<LatchedFailure>,
+    finished: bool,
+}
+
 /// Serialized `mcp-trace/1` JSONL writer. Shared via `Arc` between the run
 /// orchestrator and every [`TracingTransport`] (including session-factory
 /// respawns), so all frames of a run land in one file in append order.
 pub struct TraceWriter {
-    /// One line per frame; flushed per frame (see module docs).
-    file: Mutex<BufWriter<std::fs::File>>,
+    /// One line per frame; flushed per frame (see module docs). The failure
+    /// latch and finished bit share this lock so `finish` is a true barrier
+    /// across every cloned transport writer.
+    state: Mutex<WriterState>,
     /// Reference point for every frame's `elapsed_ms`.
     start: Instant,
     /// Apply the default-on secret redaction to client→server frames.
     redact: bool,
-    /// Warn-once latch for write failures.
-    failed: AtomicBool,
     /// Where the trace is being written (diagnostics / `Report::trace_path`).
     path: PathBuf,
 }
@@ -57,16 +68,28 @@ impl TraceWriter {
         redact: bool,
     ) -> Result<Self, TraceError> {
         let file = std::fs::File::create(path)?;
-        let mut buf = BufWriter::new(file);
+        Self::create_with_sink(path, header, start, redact, BufWriter::new(file))
+    }
+
+    fn create_with_sink(
+        path: &Path,
+        header: &TraceHeader,
+        start: Instant,
+        redact: bool,
+        mut sink: impl Write + Send + 'static,
+    ) -> Result<Self, TraceError> {
         let line = serde_json::to_string(header)?;
-        buf.write_all(line.as_bytes())?;
-        buf.write_all(b"\n")?;
-        buf.flush()?;
+        sink.write_all(line.as_bytes())?;
+        sink.write_all(b"\n")?;
+        sink.flush()?;
         Ok(Self {
-            file: Mutex::new(buf),
+            state: Mutex::new(WriterState {
+                sink: Box::new(sink),
+                failure: None,
+                finished: false,
+            }),
             start,
             redact,
-            failed: AtomicBool::new(false),
             path: path.to_path_buf(),
         })
     }
@@ -76,9 +99,12 @@ impl TraceWriter {
         &self.path
     }
 
-    /// Append one frame. Best-effort by design: a failure warns once and
-    /// never propagates — losing trace frames must not fail the run that is
-    /// being recorded.
+    /// Append one frame.
+    ///
+    /// `Transport` does not expose a separate artifact-write error channel,
+    /// so this method latches the first serialize/write/flush failure. The run
+    /// observes it through [`Self::finish`] after every traced session has
+    /// shut down. Once failed, subsequent frames are dropped.
     pub fn record(&self, dir: Direction, method: Option<&str>, body: &str) {
         let body = if self.redact && dir == Direction::ClientToServer {
             format::redact_body(body)
@@ -94,34 +120,130 @@ impl TraceWriter {
         let line = match serde_json::to_string(&frame) {
             Ok(line) => line,
             Err(err) => {
-                self.warn_once(&err.to_string());
+                self.latch_failure(
+                    std::io::ErrorKind::InvalidData,
+                    format!("frame serialization failed: {err}"),
+                );
                 return;
             }
         };
-        // A poisoned lock means another thread panicked mid-write; the file
-        // stays line-consistent (whole lines only), so keep recording.
-        let mut guard = match self.file.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+        // Recover a poisoned lock to preserve the original failure evidence.
+        // A panic while holding this lock makes completeness uncertain, so it
+        // is itself latched rather than treated as a successful trace.
+        let (mut state, poisoned) = match self.state.lock() {
+            Ok(guard) => (guard, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
         };
-        let result = guard
-            .write_all(line.as_bytes())
-            .and_then(|()| guard.write_all(b"\n"))
-            .and_then(|()| guard.flush());
+        if poisoned && state.failure.is_none() {
+            state.failure = Some(LatchedFailure {
+                kind: std::io::ErrorKind::Other,
+                message: "trace writer lock was poisoned".to_owned(),
+            });
+            self.warn("trace writer lock was poisoned");
+        }
+        if state.finished {
+            if state.failure.is_none() {
+                state.failure = Some(LatchedFailure {
+                    kind: std::io::ErrorKind::BrokenPipe,
+                    message: "attempted to record a frame after trace finalization".to_owned(),
+                });
+                self.warn("attempted to record a frame after trace finalization");
+            }
+            return;
+        }
+        if state.failure.is_some() {
+            return;
+        }
+        let result = (|| {
+            state.sink.write_all(line.as_bytes())?;
+            state.sink.write_all(b"\n")?;
+            state.sink.flush()
+        })();
         if let Err(err) = result {
-            drop(guard);
-            self.warn_once(&err.to_string());
+            let message = format!("frame write/flush failed: {err}");
+            state.failure = Some(LatchedFailure {
+                kind: err.kind(),
+                message: message.clone(),
+            });
+            self.warn(&message);
         }
     }
 
-    fn warn_once(&self, err: &str) {
-        if !self.failed.swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                path = %self.path.display(),
-                error = %err,
-                "trace recording failed; further frames may be dropped"
-            );
+    /// Finalize an explicitly requested trace.
+    ///
+    /// This is a shared barrier: it takes the same mutex used by every
+    /// `TracingTransport`, performs a final flush, marks the writer finished,
+    /// and returns the first latched failure. It is idempotent and every
+    /// clone observes the same result.
+    pub fn finish(&self) -> Result<(), TraceError> {
+        let (mut state, poisoned) = match self.state.lock() {
+            Ok(guard) => (guard, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
+        };
+        if poisoned && state.failure.is_none() {
+            state.failure = Some(LatchedFailure {
+                kind: std::io::ErrorKind::Other,
+                message: "trace writer lock was poisoned".to_owned(),
+            });
+            self.warn("trace writer lock was poisoned");
         }
+        if !state.finished {
+            if let Err(err) = state.sink.flush()
+                && state.failure.is_none()
+            {
+                let message = format!("final flush failed: {err}");
+                self.warn(&message);
+                state.failure = Some(LatchedFailure {
+                    kind: err.kind(),
+                    message,
+                });
+            }
+            state.finished = true;
+        }
+        match &state.failure {
+            Some(failure) => Err(TraceError::Io(std::io::Error::new(
+                failure.kind,
+                format!(
+                    "trace `{}` is incomplete: {}",
+                    self.path.display(),
+                    failure.message
+                ),
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn latch_failure(&self, kind: std::io::ErrorKind, message: String) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.failure.is_none() {
+            state.failure = Some(LatchedFailure {
+                kind,
+                message: message.clone(),
+            });
+            self.warn(&message);
+        }
+    }
+
+    fn warn(&self, err: &str) {
+        tracing::warn!(
+            path = %self.path.display(),
+            error = %err,
+            "trace recording failed; the traced run will fail at finalization"
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_with_test_sink(
+        path: &Path,
+        header: &TraceHeader,
+        start: Instant,
+        redact: bool,
+        sink: impl Write + Send + 'static,
+    ) -> Result<Self, TraceError> {
+        Self::create_with_sink(path, header, start, redact, sink)
     }
 }
 
@@ -187,6 +309,7 @@ impl<T: Transport> Transport for TracingTransport<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::sync::Mutex as StdMutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -217,6 +340,37 @@ mod tests {
 
     fn header() -> TraceHeader {
         TraceHeader::new("01TEST", "python mock.py", "2026-07-07T00:00:00Z")
+    }
+
+    /// Accepts and flushes the header, then deterministically rejects every
+    /// frame. This avoids filesystem- and platform-specific failure tricks.
+    struct FailAfterHeader {
+        header_flushed: bool,
+    }
+
+    impl Write for FailAfterHeader {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.header_flushed {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected trace sink failure",
+                ))
+            } else {
+                Ok(buf.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.header_flushed {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected trace sink failure",
+                ))
+            } else {
+                self.header_flushed = true;
+                Ok(())
+            }
+        }
     }
 
     #[test]
@@ -270,6 +424,38 @@ mod tests {
         w.record(Direction::ClientToServer, Some("tools/call"), req);
         let text = std::fs::read_to_string(&scratch.0).unwrap();
         assert!(text.contains("p4ss"));
+    }
+
+    #[test]
+    fn finish_propagates_latched_failure_across_shared_clones() {
+        let scratch = ScratchFile::new("injected-failure");
+        let writer = Arc::new(
+            TraceWriter::create_with_test_sink(
+                &scratch.0,
+                &header(),
+                Instant::now(),
+                true,
+                FailAfterHeader {
+                    header_flushed: false,
+                },
+            )
+            .unwrap(),
+        );
+        let transport_clone = Arc::clone(&writer);
+        transport_clone.record(
+            Direction::ClientToServer,
+            Some("tools/list"),
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+        );
+
+        let first = writer.finish().unwrap_err().to_string();
+        let second = transport_clone.finish().unwrap_err().to_string();
+        assert!(first.contains("incomplete"), "got: {first}");
+        assert!(
+            first.contains("injected trace sink failure"),
+            "got: {first}"
+        );
+        assert_eq!(first, second, "all shared clones must observe one latch");
     }
 
     /// Canned transport: fixed response, records delegated calls.

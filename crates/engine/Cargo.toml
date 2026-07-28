@@ -12,8 +12,8 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-mcp-loadtest-core = { path = "../core", version = "0.0.1" }
-mcp-loadtest-protocol = { path = "../protocol", version = "0.0.1" }
+mcp-loadtest-core = { path = "../core", version = "0.1.0" }
+mcp-loadtest-protocol = { path = "../protocol", version = "0.1.0" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }

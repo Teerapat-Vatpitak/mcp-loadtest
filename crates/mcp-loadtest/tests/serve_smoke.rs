@@ -136,5 +136,12 @@ async fn serve_mcp_responds_to_initialize_and_tools_list() {
 
     // Clean shutdown by dropping stdin → EOF for the child loop.
     drop(stdin);
-    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("serve child wait timed out")
+        .expect("serve child wait errored");
+    assert!(
+        status.success(),
+        "serve child exited unsuccessfully: {status}"
+    );
 }

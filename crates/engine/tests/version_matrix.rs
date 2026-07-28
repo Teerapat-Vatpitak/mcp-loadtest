@@ -107,7 +107,10 @@ async fn happy_path_drives_every_supported_revision() {
         );
     }
 
-    let _ = tokio::time::timeout(Duration::from_secs(5), session.shutdown()).await;
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("shutdown errored");
 }
 
 #[tokio::test]
@@ -142,7 +145,10 @@ async fn deadlock_is_attributed_to_the_revision_that_hung() {
     // The row bails after the deadlock — no further calls on a wedged session.
     assert_eq!(outcome.total_calls, 1);
 
-    let _ = tokio::time::timeout(Duration::from_secs(5), session.shutdown()).await;
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("shutdown errored");
 }
 
 #[tokio::test]
@@ -168,5 +174,8 @@ async fn degrades_to_noop_without_a_factory() {
         outcome.notes
     );
 
-    let _ = tokio::time::timeout(Duration::from_secs(5), session.shutdown()).await;
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("shutdown errored");
 }

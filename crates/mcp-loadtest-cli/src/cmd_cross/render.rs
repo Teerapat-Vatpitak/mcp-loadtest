@@ -32,7 +32,8 @@ pub(super) fn render_markdown(rows: &[ServerRow], args: &CrossArgs) -> String {
     for (idx, row) in rows.iter().enumerate() {
         let label = column_label(idx);
         let status = match &row.result {
-            Ok(_) => "ok",
+            Ok(report) if report.passed() => "ok",
+            Ok(_) => "FAILED",
             Err(_) => "FAILED",
         };
         out.push_str(&format!("- **{label}**: `{}` — {status}\n", row.command));
@@ -93,12 +94,32 @@ pub(super) fn render_markdown(rows: &[ServerRow], args: &CrossArgs) -> String {
 
     // Errors section — list any per-server failures with their full message
     // so the user can debug without spelunking through stderr.
-    let failures: Vec<&ServerRow> = rows.iter().filter(|r| r.result.is_err()).collect();
+    let failures: Vec<&ServerRow> = rows
+        .iter()
+        .filter(|row| match &row.result {
+            Ok(report) => !report.passed(),
+            Err(_) => true,
+        })
+        .collect();
     if !failures.is_empty() {
         out.push_str("\n## Errors\n\n");
         for row in failures {
             if let Err(e) = &row.result {
                 out.push_str(&format!("- `{}`: {e:#}\n", row.command));
+            } else if let Ok(report) = &row.result {
+                out.push_str(&format!(
+                    "- `{}`: correctness gate failed ({} deadlocks, {} divergences, \
+                     {} incomplete workers, {} teardown failures, \
+                     {}/{} successful calls, {} threshold violations)\n",
+                    row.command,
+                    report.scenario_outcome.deadlock_count,
+                    report.scenario_outcome.divergence_count,
+                    report.scenario_outcome.incomplete_worker_count,
+                    report.scenario_outcome.teardown_failure_count,
+                    report.scenario_outcome.successful_calls,
+                    report.scenario_outcome.total_calls,
+                    report.threshold_violations.len(),
+                ));
             }
         }
     }

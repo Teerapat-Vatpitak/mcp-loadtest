@@ -64,9 +64,13 @@ Introduce an extensible options struct rather than overloaded constructors:
 - `Run` gains `StderrCapture { Off (default), Capture, Tee }`, a
   `#[must_use] with_stderr_capture(self, _)` builder (the 3-arg `Run::new`
   signature is unchanged), and resolves the capture path to
-  `runs/<id>/server-stderr.log` (the run dir already exists by then). The CLI
-  `run --capture-stderr` / `--tee-stderr` flags map onto it; `tee` wins if both
-  are passed.
+  `runs/<id>/server-stderr.log` for the orchestrator's initial session (the
+  run dir already exists by then). Every factory-spawned session used by
+  pooled or cold-start workloads gets an immutable unique path under
+  `runs/<id>/server-stderr/session-NNNNNN.log`. Sharing one `File::create`
+  target would let concurrent workers truncate each other's evidence. The
+  CLI `run --capture-stderr` / `--tee-stderr` flags map onto it; `tee` wins if
+  both are passed.
 - The pump lives in its own file `stderr_pump.rs`, declared a **private child
   module of `stdio`** via `#[path = "stderr_pump.rs"] mod stderr_pump;` inside
   `stdio.rs`. This keeps `stdio.rs` under the 300-line production cap without
@@ -110,8 +114,8 @@ Introduce an extensible options struct rather than overloaded constructors:
 - `--capture-stderr` / `--tee-stderr` are **silent no-ops for http/sse/ws**:
   those transports have no child process. Accepted and documented; out of scope
   to invent a synthetic capture for network transports.
-- Capture/tee adds one tracked, cancellation-aware task per stdio run. The
-  inherit default path is unchanged and pays nothing.
+- Capture/tee adds one tracked, cancellation-aware task per live stdio
+  session. The inherit default path is unchanged and pays nothing.
 - Open question (deferred): no rotation / size cap on `server-stderr.log` — a
   pathological server that streams unbounded stderr can grow the file without
   limit. The stdout side is already OOM-guarded (`MAX_LINE_BYTES`); a stderr

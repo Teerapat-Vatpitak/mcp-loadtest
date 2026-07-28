@@ -132,6 +132,7 @@ mod tests {
 
     fn result_with(structured_content: Option<Value>) -> CallToolResult {
         CallToolResult {
+            meta: None,
             content: Vec::new(),
             is_error: false,
             structured_content,

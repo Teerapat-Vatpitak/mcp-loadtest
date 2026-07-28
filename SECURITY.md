@@ -1,6 +1,10 @@
 # Security policy
 
-`mcp-loadtest` is a load-testing tool that spawns user-supplied processes, parses JSON-RPC over stdio/HTTP/SSE, and exposes a self-hosted MCP server (`serve --mcp`). Security issues in this tool can affect operators running it — not the end users of MCP servers being tested. Vulnerabilities in the MCP servers under test are the responsibility of those servers' authors.
+`mcp-loadtest` is a load-testing tool that spawns user-supplied processes,
+parses JSON-RPC over stdio/HTTP/SSE/WebSocket, and exposes a self-hosted MCP
+server (`serve --mcp`). Security issues in this tool can affect operators
+running it—not the end users of MCP servers being tested. Vulnerabilities in
+the MCP servers under test are the responsibility of those servers' authors.
 
 ## How to report
 
@@ -14,7 +18,8 @@ In scope:
 
 - Child-process spawning and argv handling for the stdio transport (`Session::spawn`, command/args parsing).
 - JSON-RPC framing and parsing (line reader, message dispatch).
-- HTTP and SSE transports — URL handling, redirect policy, SSRF surface.
+- HTTP, SSE, and WebSocket transports—URL handling, remote-header secrecy,
+  redirect policy, and SSRF surface.
 - `serve --mcp` mode — path traversal, unbounded stdin reads, OOM via large payloads, request validation.
 - Supply chain — Cargo dependencies (`cargo audit` / `cargo deny` findings, advisory follow-up).
 
@@ -25,18 +30,31 @@ Out of scope:
 - DoS against the tool itself when run with deliberately malicious CLI input (e.g. `--server "obviously malicious string"`). We trust the operator's local CLI input.
 - Issues that require pre-existing local code execution on the operator's machine.
 
-## Recent hardening
+## Hardening present in the source
 
-Shipped in commit `bae92c2`:
+Implemented in commit `bae92c2`:
 
 - **Path-traversal block in `compare_runs`** — file arguments are canonicalized and rejected if they escape the expected runs directory.
 - **16 MB line-read cap on stdio transport** — protects against memory exhaustion from a malicious or buggy server emitting an unbounded line.
 - **Redirect policy set to `none`** on HTTP/SSE transports — blocks redirect-based SSRF and prevents silent redirection to unintended hosts.
 
-Shipped since:
+Implemented since:
 
+- **Bounded remote-response allocation** — Streamable HTTP bodies, legacy SSE
+  event data, and WebSocket messages are capped at 16 MiB during incremental
+  network consumption or protocol reassembly, before an oversized complete
+  payload can be materialized. SSE and WebSocket reader queues plus
+  id-mismatch buffers share a 32 MiB retained-byte budget.
 - **SSRF host-allowlist + always-on private-IP-literal block** (ADR 0012) — opt-in exact-match `[server].allowed_hosts`, plus an unconditional block of private/loopback/link-local/ULA/reserved IP-literal URLs on the HTTP/SSE/WS transports. The SSE server-provided `endpoint` URL is re-checked.
 - **DNS-rebinding defense via resolver pinning** (ADR 0016) — hostnames are resolved once at connect time, every resolved address is vetted against the same private-IP blocklist, and the vetted addresses are pinned for the actual connection (reqwest `resolve_to_addrs` for HTTP/SSE; a self-dialed, vetted TCP socket for WS). This closes the hostname→private-IP gap (e.g. `localtest.me` → `127.0.0.1`, or DNS that flips between check and connect) that ADR 0012 documented as a residual risk.
+- **Secret-safe static remote headers**—`headers_from_env` is the only
+  explicit remote-credential facility. Nonempty remote headers require
+  HTTPS/WSS, URL userinfo and fragments are rejected, HTTP redirects remain
+  disabled, and an SSE server-selected endpoint is revalidated before any
+  header is forwarded. Query strings are still transmitted to the target but
+  are redacted wholesale in reports and traces; they must not carry secrets.
+  OAuth login, discovery, refresh, DCR, DPoP, and token storage are not
+  implemented.
 
 ### Residual risk
 
@@ -46,9 +64,16 @@ Shipped since:
 
 ## Supported versions
 
-Only the latest `0.x` release line receives security fixes. Once `1.0` ships, this policy will be revisited.
+For externally published artifacts, only the latest published `0.x` line
+receives security fixes. A manifest version or source checkout is not evidence
+that a release exists; verify the exact tag, its GitHub Release, and that
+GitHub immutable releases is enabled. The release workflow refuses publication
+without that repository setting. If no GitHub Release exists yet, there is no
+externally supported binary version, although reports against the current
+candidate source are welcome. Once `1.0` ships, this policy will be revisited.
 
-| Version    | Supported |
-| ---------- | --------- |
-| latest 0.x | yes       |
-| older 0.x  | no        |
+| Version              | Supported |
+| -------------------- | --------- |
+| latest published 0.x | yes       |
+| older published 0.x  | no        |
+| unreleased source    | best effort |

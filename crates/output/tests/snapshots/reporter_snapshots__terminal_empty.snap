@@ -1,9 +1,10 @@
 ---
-source: crates/mcp-loadtest/tests/reporter_snapshots.rs
+source: crates/output/tests/reporter_snapshots.rs
+assertion_line: 287
 expression: s
 ---
 mcp-loadtest run summary
-  status:    PASS
+  status:    FAIL (no calls attempted)
   server:    python -m vibe_trading_mcp
   scenario:  empty
   duration:  0µs

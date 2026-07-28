@@ -25,6 +25,11 @@ startup_timeout = "10s"
 # allowed_hosts = ["api.example.com"]   # SSRF guard: exact-match allowlist for http/sse/ws.
 # Empty/unset = allow any public host. Private/loopback/link-local IP literals are always
 # blocked unless the literal is listed here (escape hatch, e.g. "127.0.0.1" for local tests).
+#
+# Remote auth is deliberately limited to static headers loaded from environment
+# variables. The variable must contain the complete value (for example,
+# `Bearer ey...`). OAuth login/refresh flows are not implemented.
+# headers_from_env = { Authorization = "MCP_AUTHORIZATION" }
 
 # Extra environment variables merged into the child's env. Inline table.
 [server.env]

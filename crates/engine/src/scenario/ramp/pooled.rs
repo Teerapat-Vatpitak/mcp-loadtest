@@ -27,14 +27,9 @@ use tokio::time::sleep;
 
 use super::Ramp;
 use crate::breaking_point::BreakingPointDetector;
-use crate::scenario::{RunContext, ScenarioOutcome, pool};
+use crate::scenario::{RunContext, ScenarioOutcome, pool, teardown};
 use mcp_loadtest_core::metrics::{CallOutcome, Recorder};
 use mcp_loadtest_protocol::Session;
-
-/// Per-worker graceful-shutdown budget. Bounded so one wedged server can't
-/// stall the step join; on timeout the dropped `Session` is reaped via
-/// `kill_on_drop` (same policy as `sustained`'s pooled path).
-const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Drive the full ramp with one session pool per step. See the module docs
 /// for the cost model and the per-step recorder contract.
@@ -80,7 +75,7 @@ pub(super) async fn drive_ramp_pooled(ramp: &Ramp, ctx: &RunContext) -> Scenario
                 let args = Arc::clone(&args);
                 let step_recorder = step_recorder.clone();
                 async move {
-                    let outcome = worker_call_loop(
+                    let mut outcome = worker_call_loop(
                         step_deadline,
                         &tool,
                         &args,
@@ -89,7 +84,7 @@ pub(super) async fn drive_ramp_pooled(ramp: &Ramp, ctx: &RunContext) -> Scenario
                         &worker_ctx,
                     )
                     .await;
-                    shutdown_worker(session).await;
+                    teardown::shutdown_session(session, &mut outcome, "ramp pooled worker").await;
                     outcome
                 }
             })
@@ -196,10 +191,16 @@ async fn worker_call_loop(
         outcome.total_calls += 1;
 
         match result {
-            Ok(_) => {
-                outcome.successful_calls += 1;
-                ctx.metrics.record_tool(tool, elapsed, CallOutcome::Success);
-                step_recorder.record(elapsed, CallOutcome::Success);
+            Ok(result) => {
+                let kind = if crate::scenario::is_logical_tool_error(&result) {
+                    outcome.error_count += 1;
+                    CallOutcome::ServerError
+                } else {
+                    outcome.successful_calls += 1;
+                    CallOutcome::Success
+                };
+                ctx.metrics.record_tool(tool, elapsed, kind);
+                step_recorder.record(elapsed, kind);
             }
             Err(err) => {
                 outcome.error_count += 1;
@@ -220,23 +221,6 @@ async fn worker_call_loop(
     outcome
 }
 
-/// Polite bounded teardown of one worker session; on timeout/error the child
-/// is still reaped via `kill_on_drop` when `session` drops.
-async fn shutdown_worker(session: Session) {
-    match tokio::time::timeout(WORKER_SHUTDOWN_TIMEOUT, session.shutdown()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "ramp: pooled worker shutdown errored");
-        }
-        Err(_) => {
-            tracing::warn!(
-                "ramp: pooled worker shutdown exceeded {WORKER_SHUTDOWN_TIMEOUT:?}; \
-                 child reaped via kill_on_drop"
-            );
-        }
-    }
-}
-
 /// Fold one step's merged pool outcome into the ramp total, keeping the pool
 /// notes attributable to their step level.
 fn merge_step(into: &mut ScenarioOutcome, concurrent: u32, from: ScenarioOutcome) {
@@ -245,6 +229,9 @@ fn merge_step(into: &mut ScenarioOutcome, concurrent: u32, from: ScenarioOutcome
     into.hang_count += from.hang_count;
     into.deadlock_count += from.deadlock_count;
     into.error_count += from.error_count;
+    into.divergence_count += from.divergence_count;
+    into.incomplete_worker_count += from.incomplete_worker_count;
+    into.teardown_failure_count += from.teardown_failure_count;
     into.hung_for_ms.extend(from.hung_for_ms);
     into.notes.extend(
         from.notes
@@ -270,6 +257,9 @@ mod tests {
             hang_count: 1,
             deadlock_count: 1,
             error_count: 2,
+            divergence_count: 1,
+            incomplete_worker_count: 1,
+            teardown_failure_count: 1,
             notes: vec!["pool: 3 workers (4 requested)".to_owned()],
             hung_for_ms: vec![999],
         };
@@ -279,6 +269,9 @@ mod tests {
         assert_eq!(total.hang_count, 1);
         assert_eq!(total.deadlock_count, 1);
         assert_eq!(total.error_count, 2);
+        assert_eq!(total.divergence_count, 1);
+        assert_eq!(total.incomplete_worker_count, 1);
+        assert_eq!(total.teardown_failure_count, 1);
         assert_eq!(total.hung_for_ms, vec![999]);
         assert_eq!(
             total.notes,

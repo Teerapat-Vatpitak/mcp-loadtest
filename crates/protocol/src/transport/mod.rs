@@ -7,6 +7,7 @@
 //! Agent J fills in `http.rs`. Agent K fills in `sse.rs`. Locked contracts:
 
 pub mod guard;
+pub mod headers;
 pub mod http;
 pub(crate) mod resolve;
 pub mod spawn_options;

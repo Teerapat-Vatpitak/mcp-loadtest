@@ -31,19 +31,17 @@ pub enum StderrCapture {
     /// Inherit the parent's stderr (default).
     #[default]
     Off,
-    /// Capture the server's stderr to `runs/<id>/server-stderr.log`.
+    /// Capture the initial session to `runs/<id>/server-stderr.log` and each
+    /// factory session to a unique file under `runs/<id>/server-stderr/`.
     Capture,
-    /// Capture to the file **and** mirror it live to the parent's stderr.
+    /// Capture to the per-session files **and** mirror them live to the
+    /// parent's stderr.
     Tee,
 }
 
 /// Default per-call hang threshold when neither `Thresholds` nor the scenario
 /// specify one. Matches DESIGN.md §15.1's reference.
 const DEFAULT_HANG_THRESHOLD: Duration = Duration::from_secs(5);
-
-/// Default best-effort timeout for the post-run session shutdown. Bounded so a
-/// wedged server can't hold the run open forever.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Run-level configuration. Build via [`Run::new`].
 ///
@@ -62,6 +60,11 @@ pub struct Run {
     /// file (ADR 0021). `None` (the default) records nothing; set via
     /// [`Run::with_trace`].
     pub trace_path: Option<PathBuf>,
+    /// Suppress the configured server command/URL and parsed argv from
+    /// reports, traces, spawn errors, and inherited/captured stderr. This is
+    /// reserved for the composite Action; ordinary CLI runs remain
+    /// self-describing. Set via [`Run::with_redacted_server_identity`].
+    pub redact_server_identity: bool,
 }
 
 /// Errors that can fail an entire run.
@@ -92,6 +95,7 @@ impl Run {
             output_dir,
             stderr_capture: StderrCapture::Off,
             trace_path: None,
+            redact_server_identity: false,
         }
     }
 
@@ -108,11 +112,24 @@ impl Run {
     /// Record every JSON-RPC frame of the run (handshake included) to `path`
     /// as an `mcp-trace/1` JSONL file, replayable via `trace::replay` or the
     /// CLI's `replay` subcommand. Secret-looking `tools/call` arguments are
-    /// redacted by default (ADR 0021). Sets `Report::trace_path` on the
-    /// returned report.
+    /// redacted by default (ADR 0021). The explicitly requested artifact is
+    /// fail-closed: creation or finalization failure makes [`Run::execute`]
+    /// return an error. `Report::trace_path` is set only after finalization.
     #[must_use]
     pub fn with_trace(mut self, path: PathBuf) -> Self {
         self.trace_path = Some(path);
+        self
+    }
+
+    /// Redact the configured server identity from Action-generated output.
+    ///
+    /// Besides replacing report and trace identity fields, this makes server
+    /// startup errors generic and discards child stderr so the command or its
+    /// argv cannot be echoed back by the child. Ordinary callers should not
+    /// enable this: the default keeps reports self-describing.
+    #[must_use]
+    pub fn with_redacted_server_identity(mut self) -> Self {
+        self.redact_server_identity = true;
         self
     }
 }

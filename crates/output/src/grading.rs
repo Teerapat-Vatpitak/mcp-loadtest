@@ -251,6 +251,7 @@ where
 /// recorded we grade F — there's nothing to validate.
 fn grade_error_rate(outcomes: &OutcomeCounts, profile: &GradingProfile) -> (Grade, String) {
     let total = outcomes.success
+        + outcomes.expected_rejection
         + outcomes.hang
         + outcomes.deadlock
         + outcomes.timeout
@@ -268,11 +269,12 @@ fn grade_error_rate(outcomes: &OutcomeCounts, profile: &GradingProfile) -> (Grad
         );
     }
 
+    let successful = outcomes.success + outcomes.expected_rejection;
     #[expect(
         clippy::cast_precision_loss,
         reason = "u64 call counts fit f64's 52-bit mantissa in practice; grading tolerances dwarf the error"
     )]
-    let rate = 1.0 - (outcomes.success as f64 / total as f64);
+    let rate = 1.0 - (successful as f64 / total as f64);
 
     let pct = rate * 100.0;
     grade_ascending(
@@ -358,5 +360,17 @@ mod tests {
         let (g, note) = grade_error_rate(&outcomes, &profile);
         assert_eq!(g, Grade::F);
         assert!(note.contains("no requests"), "note: {note}");
+    }
+
+    #[test]
+    fn expected_fuzz_rejections_are_successes_for_error_grading() {
+        let outcomes = OutcomeCounts {
+            expected_rejection: 100,
+            ..OutcomeCounts::default()
+        };
+        let profile = GradingProfile::default_general();
+        let (g, note) = grade_error_rate(&outcomes, &profile);
+        assert_eq!(g, Grade::A, "note: {note}");
+        assert!(note.contains("0.00%"), "note: {note}");
     }
 }

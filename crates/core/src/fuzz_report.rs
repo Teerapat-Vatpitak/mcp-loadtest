@@ -22,12 +22,16 @@ pub enum FuzzClass {
     /// Server tolerated the malformed input and returned a normal result.
     /// Often interesting — means input validation may be too permissive.
     Accepted,
-    /// JSON-RPC error in the protocol range (-32600..=-32603): server rejected
-    /// the payload as malformed per spec. The expected, healthy outcome.
+    /// The server explicitly rejected the deliberate fuzz probe in an
+    /// expected way: JSON-RPC parse/invalid-request/method/params error, or
+    /// `tools/call` returned `isError: true`.
+    ///
+    /// JSON-RPC internal error (`-32603`) is deliberately excluded: it means
+    /// the probe triggered an unexpected server failure.
     ProtocolError,
-    /// JSON-RPC error in the server-defined range (-32000..=-32099) or any
-    /// other server-side error response. Server understood the shape but
-    /// returned a domain error.
+    /// JSON-RPC internal error (`-32603`), a server-defined error
+    /// (`-32000..=-32099`), or any other unexpected server-side error
+    /// response.
     ServerError,
     /// Client-side JSON serialize/deserialize failure — typically a malformed
     /// response from the server (not the request).
@@ -40,6 +44,15 @@ pub enum FuzzClass {
     Disconnected,
     /// We classified the outcome but didn't fit any of the above. Catch-all.
     Other,
+}
+
+/// Whether a JSON-RPC error code is an explicit, healthy rejection of a
+/// deliberately malformed fuzz probe.
+///
+/// `-32603` (`Internal error`) is intentionally not included: a fuzzer must
+/// not turn an unexpected server failure into a successful probe.
+pub const fn is_expected_rejection_code(code: i64) -> bool {
+    matches!(code, -32700 | -32600 | -32601 | -32602)
 }
 
 /// One row in the fuzz report — what payload variant was sent, what came back,
@@ -160,5 +173,21 @@ mod tests {
         let report = FuzzReport::from_findings(&[], 10);
         assert_eq!(report.total, 0);
         assert!(!report.has_critical());
+    }
+
+    #[test]
+    fn expected_rejection_code_boundaries_exclude_internal_error() {
+        for code in [-32700, -32600, -32601, -32602] {
+            assert!(
+                is_expected_rejection_code(code),
+                "{code} should be an expected fuzz rejection"
+            );
+        }
+        for code in [-32701, -32603, -32599, -32000, 0] {
+            assert!(
+                !is_expected_rejection_code(code),
+                "{code} must remain an unexpected error"
+            );
+        }
     }
 }

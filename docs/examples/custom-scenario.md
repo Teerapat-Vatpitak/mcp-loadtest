@@ -7,12 +7,12 @@ extension point: implement `trait Scenario` and register it.
 
 This walkthrough builds a `CacheWarmup` scenario from scratch using
 `DeadlockProbe` as a reference. Every line maps to real code in
-[`crates/mcp-loadtest/src/scenario/deadlock_probe.rs`](../../crates/mcp-loadtest/src/scenario/deadlock_probe.rs).
+[`crates/engine/src/scenario/deadlock_probe.rs`](../../crates/engine/src/scenario/deadlock_probe.rs).
 
 ## The trait
 
 `Scenario` is defined in
-[`crates/mcp-loadtest/src/scenario/mod.rs`](../../crates/mcp-loadtest/src/scenario/mod.rs):
+[`crates/engine/src/scenario/mod.rs`](../../crates/engine/src/scenario/mod.rs):
 
 ```rust
 #[async_trait]
@@ -41,13 +41,16 @@ pub struct ScenarioOutcome {
     pub hang_count: u32,
     pub deadlock_count: u32,
     pub error_count: u64,
+    pub divergence_count: u64,
+    pub incomplete_worker_count: u64,
     pub notes: Vec<String>,
+    pub hung_for_ms: Vec<u128>,
 }
 ```
 
 ## Step 1. Write the scenario
 
-Create `crates/mcp-loadtest/src/scenario/cache_warmup.rs`. The scenario fires
+Create `crates/engine/src/scenario/cache_warmup.rs`. The scenario fires
 one warmup call (e.g. populating a cache the server lazy-loads), then issues
 `concurrent` more calls and measures only those. A regression here usually
 means the warmup didn't actually warm anything.
@@ -62,10 +65,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::Session;
-use crate::hang_detector::{HangOutcome, hang_detect};
-use crate::metrics::CallOutcome;
 use crate::scenario::{RunContext, Scenario, ScenarioOutcome};
+use mcp_loadtest_core::metrics::CallOutcome;
+use mcp_loadtest_protocol::Session;
+use mcp_loadtest_protocol::hang_detector::{HangOutcome, hang_detect};
 
 pub struct CacheWarmup {
     /// How many measured calls to issue after the warmup.
@@ -86,7 +89,7 @@ impl Scenario for CacheWarmup {
         let mut outcome = ScenarioOutcome::default();
 
         // 1. Warmup call — not recorded in the histogram.
-        let warmup = session.call_tool(&self.tool, self.args.clone());
+        let warmup = session.call_tool(&self.tool, &self.args);
         match hang_detect(warmup, self.hang_threshold, self.grace_period).await {
             HangOutcome::Ok { .. } => {
                 outcome.notes.push("warmup ok".into());
@@ -111,6 +114,13 @@ impl Scenario for CacheWarmup {
                 outcome.notes.push(format!("warmup error: {e}"));
                 return outcome;
             }
+            other => {
+                outcome.error_count += 1;
+                outcome
+                    .notes
+                    .push(format!("unexpected warmup outcome: {other:?}"));
+                return outcome;
+            }
         }
 
         // 2. Measurement loop. Observe cancellation; record into ctx.metrics.
@@ -120,22 +130,25 @@ impl Scenario for CacheWarmup {
                 break;
             }
 
-            let call_fut = session.call_tool(&self.tool, self.args.clone());
+            let call_fut = session.call_tool(&self.tool, &self.args);
             let result = hang_detect(call_fut, self.hang_threshold, self.grace_period).await;
             outcome.total_calls += 1;
 
             match result {
                 HangOutcome::Ok { duration, .. } => {
                     outcome.successful_calls += 1;
-                    ctx.metrics.record(duration, CallOutcome::Success);
+                    ctx.metrics
+                        .record_tool(&self.tool, duration, CallOutcome::Success);
                 }
                 HangOutcome::Slow { duration, .. } => {
                     outcome.hang_count += 1;
-                    ctx.metrics.record(duration, CallOutcome::Hang);
+                    ctx.metrics
+                        .record_tool(&self.tool, duration, CallOutcome::Hang);
                 }
                 HangOutcome::Deadlock { hung_for } => {
                     outcome.deadlock_count += 1;
-                    ctx.metrics.record(hung_for, CallOutcome::Deadlock);
+                    ctx.metrics
+                        .record_tool(&self.tool, hung_for, CallOutcome::Deadlock);
                     outcome
                         .notes
                         .push(format!("deadlock at iter={iter} hung_for={}ms", hung_for.as_millis()));
@@ -144,8 +157,18 @@ impl Scenario for CacheWarmup {
                 }
                 HangOutcome::Err(e) => {
                     outcome.error_count += 1;
-                    ctx.metrics.record(Duration::ZERO, CallOutcome::ServerError);
+                    ctx.metrics.record_tool(
+                        &self.tool,
+                        Duration::ZERO,
+                        CallOutcome::ServerError,
+                    );
                     outcome.notes.push(format!("error at iter={iter}: {e}"));
+                }
+                other => {
+                    outcome.error_count += 1;
+                    outcome
+                        .notes
+                        .push(format!("unexpected hang outcome at iter={iter}: {other:?}"));
                 }
             }
         }
@@ -181,14 +204,15 @@ scenario follows:
 - **Wrap every call in `hang_detect`.** It's the per-call watchdog that turns
   "hang" into a structured outcome instead of a stalled task. Even if your
   scenario isn't about deadlocks, you get them for free.
-- **Record into `ctx.metrics`, not your own collector.** The recorder is
-  lock-free per-worker; the orchestrator merges shards at the end.
+- **Record into `ctx.metrics`, not your own collector.** Outcome counters are
+  atomic and latency histograms use sharded lock-protected state; the
+  orchestrator reads one shared snapshot at the end.
 - **Bail on the first deadlock.** The session is wedged after a hang — the
   hung request still owns stdin/stdout. More calls will just hang too.
 
 ## Step 2. Register the module
 
-In `crates/mcp-loadtest/src/scenario/mod.rs`, add the module next to the
+In `crates/engine/src/scenario/mod.rs`, add the module next to the
 existing ones:
 
 ```rust
@@ -206,7 +230,8 @@ pub mod cache_warmup;   // ← new
 
 `crates/mcp-loadtest-cli/src/cmd_run/builder.rs` has a
 `build_scenario(kind, params)` dispatch (param helpers like `required_str` /
-`parse_dur_field` live in the sibling `cmd_run/params.rs`). Add a branch:
+`parse_dur_field` live in the sibling `cmd_run/params.rs`). Import
+`mcp_loadtest::scenario::cache_warmup::CacheWarmup`, then add a branch:
 
 ```rust
 "cache_warmup" => {
@@ -231,7 +256,9 @@ pub mod cache_warmup;   // ← new
 ```
 
 Update `list-scenarios` and `DESIGN.md §8` while you're there — both are
-discovery surfaces.
+discovery surfaces. Also add `"cache_warmup"` to `KNOWN_SCENARIOS` in
+`crates/core/src/config/validate.rs`; otherwise config validation rejects it
+before the CLI builder runs.
 
 ## Step 4. Drive it from TOML
 
@@ -275,8 +302,8 @@ The library API is identical to what the CLI does:
 ```rust
 use std::time::Duration;
 use mcp_loadtest::Session;
-use mcp_loadtest::scenario::Scenario;
-// use mcp_loadtest::scenario::cache_warmup::CacheWarmup;  // your new scenario
+use mcp_loadtest::scenario::cache_warmup::CacheWarmup;
+use mcp_loadtest::scenario::{RunContext, Scenario};
 use serde_json::json;
 
 #[tokio::test]
@@ -290,7 +317,13 @@ async fn cache_warmup_meets_steady_state_p99() {
         args: json!({ "ticker": "AAPL" }),
     };
     // Build a RunContext (see RunContext::new helpers in mod.rs).
-    let ctx = /* ... */;
+    let ctx = RunContext::new(
+        std::time::Instant::now(),
+        tokio_util::sync::CancellationToken::new(),
+        mcp_loadtest::metrics::Recorder::new(),
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+    );
     let outcome = scenario.drive(&mut session, &ctx).await;
     assert_eq!(outcome.deadlock_count, 0);
     assert!(outcome.successful_calls >= 95, "{outcome:?}");

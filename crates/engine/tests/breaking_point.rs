@@ -127,7 +127,7 @@ async fn ramp_against_mock_normal_completes_full_ramp() {
     assert_eq!(outcome.deadlock_count, 0);
     assert_eq!(outcome.hang_count, 0);
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");

@@ -238,3 +238,302 @@ fn syntactic_toml_error_is_toml_variant() {
         "expected ConfigError::Toml for syntax errors, got {err:?}"
     );
 }
+
+#[test]
+fn parses_remote_headers_as_environment_references() {
+    let toml_in = r#"
+        [server]
+        transport = "http"
+        url = "https://mcp.example.test/mcp"
+        headers_from_env = { Authorization = "MCP_AUTHORIZATION", "X-Tenant" = "MCP_TENANT" }
+
+        [scenario]
+        type = "sustained"
+    "#;
+    let cfg = Config::from_toml_str(toml_in).expect("header env references must parse");
+    assert_eq!(
+        cfg.server.headers_from_env.get("Authorization"),
+        Some(&"MCP_AUTHORIZATION".to_string())
+    );
+    assert_eq!(
+        cfg.server.headers_from_env.get("X-Tenant"),
+        Some(&"MCP_TENANT".to_string())
+    );
+}
+
+#[test]
+fn rejects_remote_headers_for_stdio() {
+    let toml_in = r#"
+        [server]
+        command = "python"
+        headers_from_env = { Authorization = "MCP_AUTHORIZATION" }
+
+        [scenario]
+        type = "sustained"
+    "#;
+    let err = Config::from_toml_str(toml_in).expect_err("stdio headers must be rejected");
+    assert!(
+        matches!(err, ConfigError::Invalid(ref msg) if msg.contains("headers_from_env")),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn rejects_reserved_or_unsafe_remote_header_names() {
+    for name in [
+        "MCP-Protocol-Version",
+        "Mcp-Method",
+        "Mcp-Param-Tenant",
+        "Mcp-Session-Id",
+        "Content-Type",
+        "Connection",
+        "Keep-Alive",
+        "Proxy-Authorization",
+        "TE",
+        "Trailer",
+        "Transfer-Encoding",
+        "Upgrade",
+        "Bad Header",
+    ] {
+        let toml_in = format!(
+            r#"
+                [server]
+                transport = "http"
+                url = "https://mcp.example.test/mcp"
+                [server.headers_from_env]
+                "{name}" = "MCP_SECRET"
+
+                [scenario]
+                type = "sustained"
+            "#
+        );
+        let err =
+            Config::from_toml_str(&toml_in).expect_err("reserved/unsafe header must be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(ref msg) if msg.contains("headers_from_env")),
+            "{name}: unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
+fn rejects_nonportable_header_environment_name() {
+    let toml_in = r#"
+        [server]
+        transport = "http"
+        url = "https://mcp.example.test/mcp"
+        headers_from_env = { Authorization = "BAD=ENV" }
+
+        [scenario]
+        type = "sustained"
+    "#;
+    let err = Config::from_toml_str(toml_in).expect_err("invalid env name must be rejected");
+    assert!(
+        matches!(err, ConfigError::Invalid(ref msg) if msg.contains("environment-variable")),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn remote_url_policy_rejects_userinfo_without_echoing_credentials() {
+    const SECRET: &str = "credential-sentinel-never-print";
+    for (transport, scheme) in [("http", "https"), ("sse", "https"), ("ws", "wss")] {
+        let toml_in = format!(
+            r#"
+                [server]
+                transport = "{transport}"
+                url = "{scheme}://operator:{SECRET}@mcp.example.test/rpc"
+
+                [scenario]
+                type = "sustained"
+            "#
+        );
+        let err = Config::from_toml_str(&toml_in)
+            .expect_err("URL userinfo must be rejected for every remote transport");
+        let diagnostic = err.to_string();
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "{transport}: unexpected error: {diagnostic}"
+        );
+        assert!(diagnostic.contains("userinfo"), "{transport}: {diagnostic}");
+        assert!(
+            !diagnostic.contains(SECRET),
+            "{transport}: credential leaked in diagnostic: {diagnostic}"
+        );
+    }
+}
+
+#[test]
+fn remote_headers_require_tls_for_every_remote_transport() {
+    for (transport, url) in [
+        ("http", "http://mcp.example.test/rpc"),
+        ("sse", "http://mcp.example.test/events"),
+        ("ws", "ws://mcp.example.test/socket"),
+    ] {
+        let toml_in = format!(
+            r#"
+                [server]
+                transport = "{transport}"
+                url = "{url}"
+                headers_from_env = {{ Authorization = "MCP_AUTHORIZATION" }}
+
+                [scenario]
+                type = "sustained"
+            "#
+        );
+        let err =
+            Config::from_toml_str(&toml_in).expect_err("secret-backed headers must require TLS");
+        let diagnostic = err.to_string();
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "{transport}: unexpected error: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(if transport == "ws" {
+                "wss://"
+            } else {
+                "https://"
+            }),
+            "{transport}: {diagnostic}"
+        );
+    }
+}
+
+#[test]
+fn remote_url_policy_validates_scheme_host_and_fragment() {
+    for (transport, url) in [
+        ("http", "ftp://mcp.example.test/rpc"),
+        ("sse", "https://"),
+        ("ws", "wss://mcp.example.test/socket#credential-fragment"),
+    ] {
+        let toml_in = format!(
+            r#"
+                [server]
+                transport = "{transport}"
+                url = "{url}"
+
+                [scenario]
+                type = "sustained"
+            "#
+        );
+        let err =
+            Config::from_toml_str(&toml_in).expect_err("unsafe remote endpoint must be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "{transport}: unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
+fn unauthenticated_plaintext_and_authenticated_tls_configs_remain_supported() {
+    for (transport, plaintext, tls) in [
+        (
+            "http",
+            "http://mcp.example.test/rpc",
+            "https://mcp.example.test/rpc",
+        ),
+        (
+            "sse",
+            "http://mcp.example.test/events",
+            "https://mcp.example.test/events",
+        ),
+        (
+            "ws",
+            "ws://mcp.example.test/socket",
+            "wss://mcp.example.test/socket",
+        ),
+    ] {
+        let unauthenticated = format!(
+            r#"
+                [server]
+                transport = "{transport}"
+                url = "{plaintext}"
+
+                [scenario]
+                type = "sustained"
+            "#
+        );
+        Config::from_toml_str(&unauthenticated)
+            .unwrap_or_else(|err| panic!("{transport}: plaintext without headers failed: {err}"));
+
+        let authenticated = format!(
+            r#"
+                [server]
+                transport = "{transport}"
+                url = "{tls}"
+                headers_from_env = {{ Authorization = "MCP_AUTHORIZATION" }}
+
+                [scenario]
+                type = "sustained"
+            "#
+        );
+        Config::from_toml_str(&authenticated)
+            .unwrap_or_else(|err| panic!("{transport}: TLS with headers failed: {err}"));
+    }
+}
+
+#[test]
+fn endpoint_display_drops_userinfo_fragment_and_whole_query() {
+    const RAW: &str =
+        "https://operator:credential@mcp.example.test/rpc?token=secret&tenant=private#fragment";
+    let display = config::sanitize_remote_endpoint(RAW);
+    assert_eq!(
+        display, "https://mcp.example.test/rpc?redacted",
+        "sanitizer should retain only non-secret endpoint identity"
+    );
+    for forbidden in [
+        "operator",
+        "credential",
+        "token",
+        "secret",
+        "tenant",
+        "private",
+        "fragment",
+        "#",
+    ] {
+        assert!(
+            !display.contains(forbidden),
+            "sanitized endpoint leaked `{forbidden}`: {display}"
+        );
+    }
+    assert_eq!(
+        config::sanitize_remote_endpoint("not a URL?secret=value"),
+        "<invalid remote endpoint>"
+    );
+}
+
+#[test]
+fn unknown_server_auth_fields_fail_without_echoing_literal_values() {
+    const SECRET: &str = "literal-credential-sentinel";
+    for unknown in [
+        format!(r#"headers = {{ Authorization = "{SECRET}" }}"#),
+        format!(r#"header_from_env = {{ Authorization = "{SECRET}" }}"#),
+        format!(
+            r#"[server.headers]
+                Authorization = "{SECRET}""#
+        ),
+    ] {
+        let toml_in = format!(
+            r#"
+                [server]
+                transport = "http"
+                url = "https://mcp.example.test/rpc"
+                {unknown}
+
+                [scenario]
+                type = "sustained"
+            "#
+        );
+        let err = Config::from_toml_str(&toml_in).expect_err("unknown server auth field must fail");
+        let diagnostic = err.to_string();
+        assert!(
+            matches!(err, ConfigError::Toml(_)),
+            "expected a strict serde error, got: {diagnostic}"
+        );
+        assert!(
+            !diagnostic.contains(SECRET),
+            "unknown-field diagnostic leaked a literal value: {diagnostic}"
+        );
+    }
+}

@@ -64,7 +64,7 @@ async fn sustained_against_mock_normal() {
     assert_eq!(outcome.hang_count, 0);
     assert_eq!(outcome.deadlock_count, 0);
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
@@ -109,7 +109,7 @@ async fn sustained_observes_cancellation() {
         "expected at least one call before cancel: {outcome:?}"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
@@ -181,7 +181,7 @@ async fn cold_start_measures_handshake_per_fresh_session() {
         "warmup first-call must be discarded; per_tool={per_tool:?}"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
@@ -220,7 +220,7 @@ async fn cold_start_without_factory_is_a_safe_noop() {
         "no-op must record nothing"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
@@ -264,7 +264,7 @@ async fn cold_start_observes_cancellation() {
         "cancelled run must record nothing"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");

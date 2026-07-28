@@ -94,7 +94,11 @@ fn sample_report() -> Report {
             outcomes: OutcomeCounts::default(),
         },
         process: ProcessStats::default(),
-        scenario_outcome: ScenarioOutcome::default(),
+        scenario_outcome: ScenarioOutcome {
+            divergence_count: 1,
+            teardown_failure_count: 1,
+            ..ScenarioOutcome::default()
+        },
         trace_path: None,
         threshold_violations: vec![ThresholdViolation {
             kind: ThresholdKind::P99Latency,

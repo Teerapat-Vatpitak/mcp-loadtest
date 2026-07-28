@@ -19,6 +19,7 @@ use super::{Transport, TransportError};
 // in `reader.rs` — each a child module so this file stays under the 300-line
 // production convention. See ADR 0013.
 mod reader;
+mod shutdown;
 mod spawn;
 mod stderr_pump;
 use reader::read_bounded_line;
@@ -81,14 +82,20 @@ pub struct StdioTransport {
     /// Background task draining the child's stderr into a file (and optionally
     /// teeing to the parent's stderr). `None` when stderr is inherited (the
     /// default — no pump, zero overhead). Owned here so `shutdown`/`Drop` can
-    /// stop it deterministically (mirrors the `ws`/`sse` reader task).
-    stderr_pump: Option<JoinHandle<()>>,
+    /// stop it deterministically (mirrors the `ws`/`sse` reader task). The
+    /// nested I/O result makes capture/read failures gate clean shutdown.
+    stderr_pump: Option<JoinHandle<std::io::Result<()>>>,
     /// Cancels [`Self::stderr_pump`]. Always present so the field is uniform;
     /// a fresh token in the inherit case is simply never tripped.
     pump_cancel: CancellationToken,
 }
 
 impl StdioTransport {
+    /// Sum of the internal graceful-exit, forced-reap, and stderr-pump phase
+    /// budgets. Callers applying an outer timeout must add scheduling margin
+    /// and keep their deadline strictly greater than this value.
+    pub const SHUTDOWN_BUDGET: Duration = shutdown::SHUTDOWN_BUDGET;
+
     /// Borrow the live stdin. `None` is unreachable while the transport is in
     /// use (only `shutdown` takes it, consuming `self`); we still map it to a
     /// typed error instead of `expect()` to honour the no-panic-in-lib rule.
@@ -170,44 +177,8 @@ impl Transport for StdioTransport {
     }
 
     async fn shutdown(self: Box<Self>) -> Result<(), TransportError> {
-        // `StdioTransport` now implements `Drop` (stderr-pump backstop), so we
-        // can no longer move fields out of `*self` by destructuring. Take the
-        // fields we need to consume individually via `Option::take`, then
-        // graceful teardown runs here and the trivial `Drop` (idempotent
-        // cancel + abort on an already-`None` pump) runs as the husk drops.
         let mut this = self;
-
-        // Drop stdin to signal EOF to the child (pipe close == EOF on its
-        // stdin). `ChildStdin` has no explicit close; dropping the handle is
-        // the close.
-        if let Some(stdin) = this.stdin.take() {
-            drop(stdin);
-        }
-
-        let wait_result = match this.child.as_mut() {
-            Some(child) => match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-                Ok(Ok(_status)) => Ok(()),
-                Ok(Err(e)) => Err(TransportError::Io(e)),
-                Err(_) => {
-                    let _ = child.start_kill();
-                    Ok(())
-                }
-            },
-            None => Ok(()),
-        };
-
-        // Stop the stderr pump and let it run its final flush. The child has
-        // exited (or been killed) by now so its stderr is at EOF and the pump
-        // would terminate on its own anyway; cancel + a bounded join just
-        // makes teardown deterministic and guarantees the captured file is
-        // flushed before we return. Best-effort: a slow/stuck pump is dropped
-        // by the timeout rather than blocking shutdown.
-        this.pump_cancel.cancel();
-        if let Some(handle) = this.stderr_pump.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
-        }
-
-        wait_result
+        shutdown::run(&mut this).await
     }
 }
 
@@ -216,7 +187,8 @@ impl Drop for StdioTransport {
         // Backstop when the caller skipped `shutdown`: cancel the pump and
         // abort the task. We can't `.await` in `Drop`, so the final flush is
         // best-effort via the pump's own cancel arm; `abort` guarantees no
-        // orphaned task. `kill_on_drop(true)` already reaps the child.
+        // orphaned task. `kill_on_drop(true)` requests child termination;
+        // graceful `shutdown` is the path that also waits for exit/reap.
         // Idempotent: after `shutdown` the pump is already `None` and the
         // token already cancelled, so this is a cheap no-op there.
         self.pump_cancel.cancel();

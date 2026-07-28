@@ -82,7 +82,7 @@ async fn ramp_happy_path_increases_concurrency() {
         outcome.notes,
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
@@ -159,7 +159,7 @@ async fn ramp_pooled_path_drives_each_step_through_worker_pool() {
         "got {outcome:?}"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");

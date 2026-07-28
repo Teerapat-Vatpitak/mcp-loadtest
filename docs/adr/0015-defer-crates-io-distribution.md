@@ -1,7 +1,13 @@
-# 15. Defer crates.io; distribute the first release (v0.0.1) via git-install + GitHub Release binaries
+# 15. Historical v0.0.1 distribution plan (not executed)
 
 Date: 2026-05-18
 Status: Accepted
+
+**Outcome annotation (2026-07-28):** this distribution plan was not executed
+for `v0.0.1`; that version was never tagged or released. `v0.1.0` is the first
+candidate, and public visibility/tag/Release operations are governed by
+[`docs/RELEASE.md`](../RELEASE.md). crates.io remains unpublished and requires
+a separate explicit approval.
 
 Amends [0004](0004-compete-with-reaatech.md): the head-on-competition strategy
 stands; only the first release's distribution **channel and timing** change. Supersedes
@@ -9,8 +15,9 @@ the "published to crates.io" clause of DESIGN.md §10 "Definition of done".
 
 ## Context
 
-v0.0.1 is code-complete and ready to tag (CI green, names free, packaging
-verified). The original Definition of Done assumed a crates.io publish.
+At the time of this decision, `v0.0.1` was believed code-complete and ready to
+tag. In fact, no tag or release was subsequently created. The original
+Definition of Done assumed a crates.io publish.
 
 crates.io is **append-only and irreversible**:
 
@@ -24,9 +31,10 @@ the public API surface may still move in 0.x, and the name/version is forever on
 taken. We still want ADR 0004's public-feedback loop reopened _now_, just without
 the irreversible lock-in.
 
-## Decision
+## Historical decision
 
-Defer crates.io. Ship v0.0.1 through two reversible channels:
+The decision at the time was to defer crates.io and ship `v0.0.1` through two
+reversible channels. It was never carried out:
 
 1. **`cargo install --git`** —
    `cargo install --git https://github.com/Teerapat-Vatpitak/mcp-loadtest mcp-loadtest-cli`.

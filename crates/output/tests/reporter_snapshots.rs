@@ -120,6 +120,9 @@ fn pass_report() -> Report {
             hang_count: 0,
             deadlock_count: 0,
             error_count: 0,
+            divergence_count: 0,
+            incomplete_worker_count: 0,
+            teardown_failure_count: 0,
             notes: vec![],
             hung_for_ms: vec![],
         },
@@ -144,6 +147,9 @@ fn fail_report() -> Report {
             hang_count: 0,
             deadlock_count: 0,
             error_count: 45,
+            divergence_count: 0,
+            incomplete_worker_count: 0,
+            teardown_failure_count: 2,
             notes: vec!["one of three deadlocks occurred at 23s".to_string()],
             hung_for_ms: vec![],
         },
@@ -155,6 +161,99 @@ fn fail_report() -> Report {
         }],
         coverage: None,
     }
+}
+
+#[test]
+fn json_exposes_divergence_and_gates_passed() {
+    let mut report = pass_report();
+    report.scenario_outcome.divergence_count = 1;
+    let rendered = JsonReporter
+        .render(&report)
+        .expect("render divergence report");
+    let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid report json");
+    assert_eq!(value["divergence_count"], 1);
+    assert_eq!(value["passed"], false);
+}
+
+#[test]
+fn json_exposes_incomplete_workers_and_gates_passed() {
+    let mut report = pass_report();
+    report.scenario_outcome.incomplete_worker_count = 1;
+    let rendered = JsonReporter
+        .render(&report)
+        .expect("render incomplete-worker report");
+    let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid report json");
+    assert_eq!(value["incomplete_worker_count"], 1);
+    assert_eq!(value["passed"], false);
+}
+
+#[test]
+fn every_reporter_exposes_teardown_failures_and_gates_passed() {
+    let mut report = pass_report();
+    report.scenario_outcome.teardown_failure_count = 2;
+
+    let json = JsonReporter.render(&report).expect("render teardown JSON");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("valid report json");
+    assert_eq!(value["teardown_failure_count"], 2);
+    assert_eq!(value["passed"], false);
+
+    let terminal = TerminalReporter
+        .render(&report)
+        .expect("render teardown terminal report");
+    assert!(terminal.contains("2 teardown failures"), "{terminal}");
+    assert!(terminal.contains("teardown failures:"), "{terminal}");
+
+    let markdown = MarkdownReporter
+        .render(&report)
+        .expect("render teardown markdown report");
+    assert!(markdown.contains("2 teardown failures"), "{markdown}");
+    assert!(markdown.contains("- Teardown failures: 2"), "{markdown}");
+
+    let html = HtmlReporter
+        .render(&report)
+        .expect("render teardown HTML report");
+    assert!(html.contains("2 teardown failures"), "{html}");
+    assert!(
+        html.contains("<strong>Teardown failures:</strong> 2"),
+        "{html}"
+    );
+}
+
+#[test]
+fn reporters_expose_expected_fuzzer_rejections_as_successes() {
+    let mut report = pass_report();
+    report.scenario_name = "fuzzer".to_owned();
+    report.scenario_outcome.total_calls = 2;
+    report.scenario_outcome.successful_calls = 2;
+    report.metrics.throughput.total_requests = 2;
+    report.metrics.throughput.successful_requests = 2;
+    report.metrics.outcomes.success = 0;
+    report.metrics.outcomes.expected_rejection = 2;
+    let rendered = JsonReporter
+        .render(&report)
+        .expect("render expected-rejection report");
+    let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid report json");
+    assert_eq!(value["expected_rejection_count"], 2);
+    assert_eq!(value["errors"]["total"], 0);
+    assert_eq!(value["passed"], true);
+
+    let terminal = TerminalReporter
+        .render(&report)
+        .expect("render expected-rejection terminal report");
+    assert!(terminal.contains("expected rejections: 2"), "{terminal}");
+
+    let markdown = MarkdownReporter
+        .render(&report)
+        .expect("render expected-rejection markdown report");
+    assert!(markdown.contains("- Expected rejections: 2"), "{markdown}");
+
+    let html = HtmlReporter
+        .render(&report)
+        .expect("render expected-rejection HTML report");
+    assert!(
+        html.contains("<strong>Expected rejections:</strong> 2"),
+        "{html}"
+    );
 }
 
 #[test]

@@ -4,34 +4,29 @@
 //! `tools/call` invocations and wraps each one with [`hang_detect`] to
 //! classify it as success / hang / deadlock / error.
 //!
-//! # M2 limitation
-//!
-//! [`Session::call_tool`] takes `&mut self`, so a single session cannot drive
-//! the N calls truly concurrently. The DESIGN.md §15.2 spec requires a
-//! synchronization barrier across N **independent** sessions, which depends on
-//! a session pool the orchestrator hasn't built yet (M3).
-//!
-//! For M2 we therefore issue N **sequential** calls against the single given
-//! session and rely on `hang_detect` to classify each. This is enough to
-//! catch the lazy-init pattern (the offending call still hangs forever on the
-//! buggy server) — it just isn't the highest-pressure form of the test. The
-//! `concurrent` knob is honored verbatim once the session pool lands.
+//! For `concurrent > 1`, every invocation owns an independent session from
+//! [`RunContext::session_factory`]. The shared pool start gate releases all
+//! calls only after every live worker is ready, matching DESIGN §15.2's
+//! concurrency requirement. A bare direct-library context without a factory
+//! is rejected explicitly rather than silently serializing the probe.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::scenario::{RunContext, Scenario, ScenarioOutcome};
+use crate::scenario::{
+    RunContext, Scenario, ScenarioOutcome, classify_error, is_logical_tool_error, pool, teardown,
+};
 use mcp_loadtest_core::metrics::CallOutcome;
 use mcp_loadtest_protocol::Session;
 use mcp_loadtest_protocol::hang_detector::{HangOutcome, hang_detect};
 
 /// Probe a server for the deadlock bug class.
 ///
-/// Issues `concurrent` tool calls against `tool` (sequential in M2 — see
-/// module-level docs) and classifies each via [`hang_detect`]. Reports back
-/// a [`ScenarioOutcome`] tallying success / hang / deadlock / error counts.
+/// Issues `concurrent` synchronized tool calls against independent sessions
+/// and classifies each via [`hang_detect`].
 pub struct DeadlockProbe {
     /// Number of `tools/call` invocations to issue.
     pub concurrent: u32,
@@ -48,75 +43,63 @@ pub struct DeadlockProbe {
 #[async_trait]
 impl Scenario for DeadlockProbe {
     async fn drive(&self, session: &mut Session, ctx: &RunContext) -> ScenarioOutcome {
-        let mut outcome = ScenarioOutcome::default();
-
-        for iter in 0..self.concurrent {
-            if ctx.is_cancelled() {
-                outcome.notes.push(format!("cancelled before iter={iter}"));
-                break;
-            }
-
-            let call_fut = session.call_tool(&self.tool, &self.args);
-            let hang_outcome = hang_detect(call_fut, self.hang_threshold, self.grace_period).await;
-
-            outcome.total_calls += 1;
-            match hang_outcome {
-                HangOutcome::Ok { duration, .. } => {
-                    outcome.successful_calls += 1;
-                    ctx.metrics
-                        .record_tool(&self.tool, duration, CallOutcome::Success);
-                }
-                HangOutcome::Slow { duration, .. } => {
-                    outcome.hang_count += 1;
-                    ctx.metrics
-                        .record_tool(&self.tool, duration, CallOutcome::Hang);
-                    outcome.notes.push(format!(
-                        "slow response: tool={} iter={} took={}ms",
-                        self.tool,
-                        iter,
-                        duration.as_millis()
-                    ));
-                }
-                HangOutcome::Deadlock { hung_for } => {
-                    outcome.deadlock_count += 1;
-                    outcome.hung_for_ms.push(hung_for.as_millis());
-                    ctx.metrics
-                        .record_tool(&self.tool, hung_for, CallOutcome::Deadlock);
-                    outcome.notes.push(format!(
-                        "deadlock detected: tool={} iter={} hung_for={}ms",
-                        self.tool,
-                        iter,
-                        hung_for.as_millis()
-                    ));
-                    // After a deadlock the underlying session is wedged: the
-                    // hung request still occupies stdin/stdout. Bail rather
-                    // than try further calls that will also hang.
-                    break;
-                }
-                HangOutcome::Err(e) => {
-                    outcome.error_count += 1;
-                    // Best-effort classification — a richer mapping lives in §18,
-                    // but for M2 we collapse all transport/server errors into one bucket.
-                    ctx.metrics
-                        .record_tool(&self.tool, Duration::ZERO, CallOutcome::ServerError);
-                    outcome
-                        .notes
-                        .push(format!("error: tool={} iter={} err={}", self.tool, iter, e));
-                }
-                // `HangOutcome` is `#[non_exhaustive]` (mcp-loadtest-protocol):
-                // a cross-crate wildcard is mandatory. Only Ok/Slow/Deadlock/
-                // Err exist today; count any future variant as an error so it
-                // is never silently dropped from the outcome.
-                other => {
-                    outcome.error_count += 1;
-                    outcome
-                        .notes
-                        .push(format!("unexpected hang outcome at iter={iter}: {other:?}"));
-                }
-            }
+        if self.concurrent == 0 {
+            return invalid_plan("concurrent must be >= 1");
+        }
+        if self.hang_threshold.is_zero() {
+            return invalid_plan("hang_threshold must be > 0");
+        }
+        if self.concurrent == 1 {
+            return drive_one(
+                0,
+                session,
+                &self.tool,
+                &self.args,
+                self.hang_threshold,
+                self.grace_period,
+                ctx,
+            )
+            .await;
+        }
+        if ctx.session_factory.is_none() {
+            return invalid_plan(
+                "a session_factory is required for synchronized concurrent calls \
+                 (Run::execute attaches one automatically)",
+            );
         }
 
-        outcome
+        let tool = Arc::new(self.tool.clone());
+        let args = Arc::new(self.args.clone());
+        let hang_threshold = self.hang_threshold;
+        let grace_period = self.grace_period;
+        pool::drive_pooled(
+            ctx,
+            self.concurrent,
+            move |iter, mut session, worker_ctx| {
+                let tool = Arc::clone(&tool);
+                let args = Arc::clone(&args);
+                async move {
+                    let mut outcome = drive_one(
+                        iter,
+                        &mut session,
+                        &tool,
+                        &args,
+                        hang_threshold,
+                        grace_period,
+                        &worker_ctx,
+                    )
+                    .await;
+                    teardown::shutdown_session(
+                        session,
+                        &mut outcome,
+                        format!("deadlock_probe worker {iter}"),
+                    )
+                    .await;
+                    outcome
+                }
+            },
+        )
+        .await
     }
 
     fn config_schema(&self) -> Value {
@@ -155,6 +138,89 @@ impl Scenario for DeadlockProbe {
     fn name(&self) -> &'static str {
         "deadlock_probe"
     }
+}
+
+fn invalid_plan(message: &str) -> ScenarioOutcome {
+    ScenarioOutcome {
+        error_count: 1,
+        notes: vec![format!("deadlock_probe: invalid plan — {message}")],
+        ..ScenarioOutcome::default()
+    }
+}
+
+async fn drive_one(
+    iter: u32,
+    session: &mut Session,
+    tool: &str,
+    args: &Value,
+    hang_threshold: Duration,
+    grace_period: Duration,
+    ctx: &RunContext,
+) -> ScenarioOutcome {
+    let mut outcome = ScenarioOutcome::default();
+    if ctx.is_cancelled() {
+        outcome.error_count = 1;
+        ctx.metrics
+            .record_tool(tool, Duration::ZERO, CallOutcome::Cancelled);
+        outcome.notes.push(format!("cancelled before iter={iter}"));
+        return outcome;
+    }
+
+    let hang_outcome =
+        hang_detect(session.call_tool(tool, args), hang_threshold, grace_period).await;
+    outcome.total_calls = 1;
+    match hang_outcome {
+        HangOutcome::Ok { result, duration } => {
+            if is_logical_tool_error(&result) {
+                outcome.error_count = 1;
+                ctx.metrics
+                    .record_tool(tool, duration, CallOutcome::ServerError);
+            } else {
+                outcome.successful_calls = 1;
+                ctx.metrics
+                    .record_tool(tool, duration, CallOutcome::Success);
+            }
+        }
+        HangOutcome::Slow { result, duration } => {
+            outcome.hang_count = 1;
+            if is_logical_tool_error(&result) {
+                outcome.error_count = 1;
+                ctx.metrics
+                    .record_tool(tool, duration, CallOutcome::ServerError);
+            } else {
+                ctx.metrics.record_tool(tool, duration, CallOutcome::Hang);
+            }
+            outcome.notes.push(format!(
+                "slow response: tool={tool} iter={iter} took={}ms",
+                duration.as_millis()
+            ));
+        }
+        HangOutcome::Deadlock { hung_for } => {
+            outcome.deadlock_count = 1;
+            outcome.hung_for_ms.push(hung_for.as_millis());
+            ctx.metrics
+                .record_tool(tool, hung_for, CallOutcome::Deadlock);
+            outcome.notes.push(format!(
+                "deadlock detected: tool={tool} iter={iter} hung_for={}ms",
+                hung_for.as_millis()
+            ));
+        }
+        HangOutcome::Err(err) => {
+            outcome.error_count = 1;
+            ctx.metrics
+                .record_tool(tool, Duration::ZERO, classify_error(&err));
+            outcome
+                .notes
+                .push(format!("error: tool={tool} iter={iter} err={err}"));
+        }
+        other => {
+            outcome.error_count = 1;
+            outcome
+                .notes
+                .push(format!("unexpected hang outcome at iter={iter}: {other:?}"));
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]

@@ -156,3 +156,96 @@ async fn strict_mode_lets_schema_compliant_runs_pass() {
         "expected successful calls: {v}"
     );
 }
+
+#[tokio::test]
+async fn action_output_override_wins_over_config_report_dir() {
+    let tmp = tempdir().expect("tempdir");
+    let config_report_dir = tmp.path().join("config-runs");
+    let action_report_dir = tmp.path().join("action-runs");
+    let cfg_path = tmp.path().join("bench.toml");
+
+    fs::write(
+        &cfg_path,
+        config_toml(r#"{ msg = "hello" }"#, config_report_dir.to_str().unwrap()),
+    )
+    .expect("write config");
+
+    let result = cmd_run::run_from_config_with_output(
+        &cfg_path,
+        false,
+        false,
+        None,
+        Some(action_report_dir.clone()),
+        false,
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "Action override run should pass, got {result:?}"
+    );
+    assert!(
+        !config_report_dir.exists(),
+        "config report root must not be used when the private Action override is present"
+    );
+    let run_dir = sole_run_dir(&action_report_dir);
+    assert!(run_dir.join("metrics.json").is_file());
+    assert!(run_dir.join("report.md").is_file());
+}
+
+#[tokio::test]
+async fn action_mode_redacts_report_and_trace_server_identity() {
+    let tmp = tempdir().expect("tempdir");
+    let config_report_dir = tmp.path().join("config-runs");
+    let action_report_dir = tmp.path().join("action-runs");
+    let trace_path = tmp.path().join("action-trace.jsonl");
+    let cfg_path = tmp.path().join("bench.toml");
+    let sentinel = "ACTION_SERVER_SECRET_7F3B";
+
+    let mut toml = config_toml(r#"{ msg = "hello" }"#, config_report_dir.to_str().unwrap());
+    let mock = mock_schema_fixture().to_string_lossy().replace('\\', "/");
+    let original_args = format!(r#"args = ["{mock}"]"#);
+    let secret_args = format!(r#"args = ["{mock}", "{sentinel}"]"#);
+    assert!(toml.contains(&original_args));
+    toml = toml.replace(&original_args, &secret_args);
+    fs::write(&cfg_path, toml).expect("write config");
+
+    let result = cmd_run::run_from_config_with_output(
+        &cfg_path,
+        false,
+        false,
+        Some(trace_path.clone()),
+        Some(action_report_dir.clone()),
+        true,
+    )
+    .await;
+    assert!(result.is_ok(), "redacted Action run failed: {result:?}");
+    assert!(!config_report_dir.exists());
+
+    let run_dir = sole_run_dir(&action_report_dir);
+    let metrics_text = fs::read_to_string(run_dir.join("metrics.json")).expect("read metrics.json");
+    let report_text = fs::read_to_string(run_dir.join("report.md")).expect("read report.md");
+    let trace_text = fs::read_to_string(&trace_path).expect("read trace");
+    for (name, text) in [
+        ("metrics.json", &metrics_text),
+        ("report.md", &report_text),
+        ("trace", &trace_text),
+    ] {
+        assert!(
+            !text.contains(sentinel) && !text.contains(&mock),
+            "{name} leaked configured server identity"
+        );
+    }
+
+    let metrics: serde_json::Value =
+        serde_json::from_str(&metrics_text).expect("parse metrics.json");
+    assert_eq!(metrics["server"]["command"], "[REDACTED]");
+    assert_eq!(metrics["server"]["args"], serde_json::json!([]));
+    let trace_header: serde_json::Value = serde_json::from_str(
+        trace_text
+            .lines()
+            .next()
+            .expect("trace must contain a header"),
+    )
+    .expect("parse trace header");
+    assert_eq!(trace_header["server"], "[REDACTED]");
+}

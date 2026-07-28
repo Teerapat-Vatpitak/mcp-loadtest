@@ -1,5 +1,5 @@
 ---
-source: crates/mcp-loadtest/tests/reporter_snapshots.rs
+source: crates/output/tests/reporter_snapshots.rs
 expression: j
 ---
 {
@@ -53,6 +53,7 @@ expression: j
   },
   "deadlock_count": 0,
   "hang_count": 0,
+  "teardown_failure_count": 2,
   "trace_path": "./trace.jsonl",
   "threshold_violations": [
     {

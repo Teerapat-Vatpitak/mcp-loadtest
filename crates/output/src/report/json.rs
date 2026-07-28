@@ -50,6 +50,14 @@ struct ReportView<'a> {
     process: ProcessView<'a>,
     deadlock_count: u32,
     hang_count: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    divergence_count: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    incomplete_worker_count: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    teardown_failure_count: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    expected_rejection_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     trace_path: Option<String>,
     threshold_violations: Vec<ThresholdView<'a>>,
@@ -72,6 +80,10 @@ impl<'a> From<&'a Report> for ReportView<'a> {
             process: ProcessView::from(&r.process),
             deadlock_count: r.scenario_outcome.deadlock_count,
             hang_count: r.scenario_outcome.hang_count,
+            divergence_count: r.scenario_outcome.divergence_count,
+            incomplete_worker_count: r.scenario_outcome.incomplete_worker_count,
+            teardown_failure_count: r.scenario_outcome.teardown_failure_count,
+            expected_rejection_count: r.metrics.outcomes.expected_rejection,
             trace_path: r.trace_path.as_ref().map(|p| p.display().to_string()),
             threshold_violations: r
                 .threshold_violations
@@ -81,6 +93,10 @@ impl<'a> From<&'a Report> for ReportView<'a> {
             passed: r.passed(),
         }
     }
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Serialize)]

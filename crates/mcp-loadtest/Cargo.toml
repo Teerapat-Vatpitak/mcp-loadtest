@@ -40,10 +40,10 @@ serve = []
 tui = ["mcp-loadtest-output/tui"]
 
 [dependencies]
-mcp-loadtest-core = { path = "../core", version = "0.0.1" }
-mcp-loadtest-protocol = { path = "../protocol", version = "0.0.1" }
-mcp-loadtest-engine = { path = "../engine", version = "0.0.1" }
-mcp-loadtest-output = { path = "../output", version = "0.0.1" }
+mcp-loadtest-core = { path = "../core", version = "0.1.0" }
+mcp-loadtest-protocol = { path = "../protocol", version = "0.1.0" }
+mcp-loadtest-engine = { path = "../engine", version = "0.1.0" }
+mcp-loadtest-output = { path = "../output", version = "0.1.0" }
 # The crate is a thin re-export facade over the four workspace crates above.
 # The only direct deps are what the feature-gated `serve` module uses (verified
 # by grep: serve/ imports tokio, serde_json, thiserror and nothing else).

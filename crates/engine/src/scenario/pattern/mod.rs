@@ -85,8 +85,9 @@ pub struct PatternScenario {
     /// and `"sustained"` when adapting legacy sustained configs with
     /// `[[scenario.tool_call]]` / `patterns`.
     pub scenario_name: &'static str,
-    /// Declared concurrency target. See `sustained` module docs: currently
-    /// informational because a single `Session` serializes calls.
+    /// Concurrency target. A [`RunContext`] carrying a session factory drives
+    /// this many independent sessions; a bare direct-library context can only
+    /// drive one and reports the sequential fallback explicitly.
     pub concurrent: u32,
     /// Total time to keep selecting and driving patterns.
     pub duration: Duration,

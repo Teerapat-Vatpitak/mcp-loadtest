@@ -13,15 +13,130 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and release (e.g. v0.0.1)"
+        description: "Existing tag to build and release (e.g. v0.1.0)"
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  preflight:
+    name: release preflight
+    runs-on: ubuntu-latest
+    outputs:
+      release_sha: ${{ steps.release_identity.outputs.release_sha }}
+      tag_object_sha: ${{ steps.release_identity.outputs.tag_object_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Verify immutable release identity
+        id: release_identity
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          test -n "$version"
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::release tag must be a stable vMAJOR.MINOR.PATCH tag"
+            exit 1
+          fi
+          test "$RELEASE_TAG" = "v${version}" || {
+            echo "::error::release tag does not match the workspace version"
+            exit 1
+          }
+          test "$(git cat-file -t "$RELEASE_TAG")" = "tag" || {
+            echo "::error::release tag must be an annotated tag"
+            exit 1
+          }
+          grep -F "## [${version}]" CHANGELOG.md >/dev/null || {
+            echo "::error::CHANGELOG.md has no matching release section"
+            exit 1
+          }
+          release_sha="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          tag_object_sha="$(git rev-parse "$RELEASE_TAG")"
+          test "$(git rev-parse HEAD)" = "$release_sha" || {
+            echo "::error::checkout does not match the release tag"
+            exit 1
+          }
+          printf 'release_sha=%s\n' "$release_sha" >>"$GITHUB_OUTPUT"
+          printf 'tag_object_sha=%s\n' "$tag_object_sha" >>"$GITHUB_OUTPUT"
+
+      - name: Require GitHub immutable releases
+        env:
+          IMMUTABLE_RELEASES_AUDIT_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_AUDIT_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$IMMUTABLE_RELEASES_AUDIT_TOKEN" || {
+            echo "::error::missing IMMUTABLE_RELEASES_AUDIT_TOKEN (fine-grained, Administration: read)"
+            exit 1
+          }
+          enabled="$(
+            GH_TOKEN="$IMMUTABLE_RELEASES_AUDIT_TOKEN" \
+              gh api "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq '.enabled'
+          )"
+          test "$enabled" = "true" || {
+            echo "::error::GitHub immutable releases are disabled; refusing to publish a mutable tag/assets trust anchor"
+            exit 1
+          }
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install nextest
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2
+        with:
+          tool: nextest
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2
+        with:
+          tool: cargo-deny
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Run release checks
+        run: bash scripts/ci-checks.sh
+
+      - name: Run repeat/stress gate (no retries)
+        run: bash scripts/repeat-tests.sh 5 target/test-artifacts/release-repeat
+
+      - name: Run latest official scoped scenarios for final-spec subset
+        run: bash crates/protocol/tests/run-official-conformance.sh
+
+      - name: Upload release-gate evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-gate-evidence
+          path: |
+            target/nextest/ci/junit.xml
+            target/test-artifacts/ci/
+            target/test-artifacts/release-repeat/
+            target/official-conformance-results/
+          if-no-files-found: warn
+          retention-days: 30
+
+  action-contract:
+    name: full composite Action contract
+    needs: preflight
+    uses: ./.github/workflows/action-contract.yml
+    with:
+      source-ref: ${{ needs.preflight.outputs.release_sha }}
+
   build:
     name: ${{ matrix.target }}
+    needs: [preflight, action-contract]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -32,9 +147,15 @@ jobs:
           - { os: macos-latest, target: x86_64-apple-darwin }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.preflight.outputs.release_sha }}
+
+      - name: Verify approved source revision
+        shell: bash
+        env:
+          APPROVED_SHA: ${{ needs.preflight.outputs.release_sha }}
+        run: test "$(git rev-parse HEAD)" = "$APPROVED_SHA"
 
       - name: Install Rust (stable + target)
         run: |
@@ -71,27 +192,241 @@ jobs:
           # `sha256sum -c` works cross-platform (Out-File would emit CRLF).
           [IO.File]::WriteAllText((Join-Path $PWD "$dir.zip.sha256"), "$h  $dir.zip`n")
 
-      - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload packaged target
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          # Each matrix job only produces its own-OS archive (unix→tar.gz,
-          # windows→zip); the shared globs below intentionally don't all match
-          # per job. The Build/Package steps are the real guards (they fail the
-          # job before this step if no binary was produced).
-          fail_on_unmatched_files: false
-          files: |
+          name: release-target-${{ matrix.target }}
+          path: |
             mcp-loadtest-*.tar.gz
             mcp-loadtest-*.tar.gz.sha256
             mcp-loadtest-*.zip
             mcp-loadtest-*.zip.sha256
-          body: |
-            Prebuilt binaries for ${{ github.event.inputs.tag || github.ref_name }}. Full notes: [CHANGELOG.md](https://github.com/Teerapat-Vatpitak/mcp-loadtest/blob/main/CHANGELOG.md).
+          if-no-files-found: error
+          retention-days: 7
 
-            **Install from source** (not on crates.io — [ADR 0015](https://github.com/Teerapat-Vatpitak/mcp-loadtest/blob/main/docs/adr/0015-defer-crates-io-distribution.md)):
+  publish:
+    name: publish complete release
+    needs: [preflight, action-contract, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.release_sha }}
+          fetch-depth: 0
 
-            ```
-            cargo install --git https://github.com/Teerapat-Vatpitak/mcp-loadtest mcp-loadtest-cli
-            ```
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-target-*
+          path: dist
+          merge-multiple: true
 
-            Or download a prebuilt archive below (verify with the matching `.sha256`).
+      - name: Verify complete release set
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          APPROVED_SHA: ${{ needs.preflight.outputs.release_sha }}
+          APPROVED_TAG_OBJECT_SHA: ${{ needs.preflight.outputs.tag_object_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          test "$(git rev-parse HEAD)" = "$APPROVED_SHA"
+          test "$(git cat-file -t "$RELEASE_TAG")" = "tag"
+          test "$(git rev-parse "$RELEASE_TAG")" = "$APPROVED_TAG_OBJECT_SHA" || {
+            echo "::error::annotated tag object ${RELEASE_TAG} moved after preflight"
+            exit 1
+          }
+          test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$APPROVED_SHA" || {
+            echo "::error::${RELEASE_TAG} moved after preflight"
+            exit 1
+          }
+          archives=(
+            "mcp-loadtest-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
+            "mcp-loadtest-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz"
+            "mcp-loadtest-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz"
+            "mcp-loadtest-${RELEASE_TAG}-x86_64-pc-windows-msvc.zip"
+          )
+          for archive in "${archives[@]}"; do
+            test -f "dist/${archive}" || {
+              echo "::error::missing release archive ${archive}"
+              exit 1
+            }
+            test -f "dist/${archive}.sha256" || {
+              echo "::error::missing checksum ${archive}.sha256"
+              exit 1
+            }
+            (cd dist && sha256sum -c "${archive}.sha256")
+          done
+          actual="$(find dist -maxdepth 1 -type f | wc -l)"
+          test "$actual" -eq 8 || {
+            echo "::error::expected exactly 8 release files, found ${actual}"
+            exit 1
+          }
+
+      - name: Create draft, verify assets, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_RELEASES_AUDIT_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_AUDIT_TOKEN }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          APPROVED_SHA: ${{ needs.preflight.outputs.release_sha }}
+          APPROVED_TAG_OBJECT_SHA: ${{ needs.preflight.outputs.tag_object_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          test "$(git cat-file -t "$RELEASE_TAG")" = "tag"
+          test "$(git rev-parse "$RELEASE_TAG")" = "$APPROVED_TAG_OBJECT_SHA" || {
+            echo "::error::annotated tag object ${RELEASE_TAG} moved after artifact verification"
+            exit 1
+          }
+          test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$APPROVED_SHA" || {
+            echo "::error::${RELEASE_TAG} moved after artifact verification"
+            exit 1
+          }
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release ${RELEASE_TAG} already exists; assets are immutable—issue a new version"
+            exit 1
+          fi
+
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            printf 'Prebuilt binaries for `%s`. Full notes: [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md).\n\n' \
+              "$RELEASE_TAG" "$GITHUB_REPOSITORY" "$RELEASE_TAG"
+            printf '**Install from source** (not on crates.io):\n\n'
+            printf '```\n'
+            printf 'cargo install --git https://github.com/%s --tag %s --locked mcp-loadtest-cli\n' \
+              "$GITHUB_REPOSITORY" "$RELEASE_TAG"
+            printf '```\n\n'
+            printf 'Or download a prebuilt archive below and verify it with the matching `.sha256` file.\n'
+            printf '\n**Known limitations**\n\n'
+            printf -- '- Remote authentication is limited to static environment-backed request headers. Any such header requires HTTPS/WSS, URL userinfo is forbidden, and query strings are transmitted but wholly redacted in reports/traces and must not carry secrets. There is no OAuth discovery, login, refresh, DCR, DPoP, or token store.\n'
+            printf -- '- MCP `2026-07-28` final-spec support is scoped. The retained official-client run covers five tools/discover, request-metadata, and request-header scenarios—not the full, auth, MRTR/request-state, subscriptions/listen, schema-reference, server, or authorization-server suites. The pinned harness still places this revision in its draft slot and vendors a pre-final schema; the final schema delta is confined to subscriptions/listen, outside the executed scope.\n'
+            printf '  [Reviewed conformance scope](https://github.com/%s/blob/%s/crates/protocol/tests/conformance-scope-2026-07-28.tsv).\n' \
+              "$GITHUB_REPOSITORY" "$RELEASE_TAG"
+          } >"$notes"
+
+          # A failed upload can leave only a draft; nothing becomes public
+          # until all eight assets are present and checked below.
+          release_files=(
+            "dist/mcp-loadtest-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
+            "dist/mcp-loadtest-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz.sha256"
+            "dist/mcp-loadtest-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz"
+            "dist/mcp-loadtest-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz.sha256"
+            "dist/mcp-loadtest-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz"
+            "dist/mcp-loadtest-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz.sha256"
+            "dist/mcp-loadtest-${RELEASE_TAG}-x86_64-pc-windows-msvc.zip"
+            "dist/mcp-loadtest-${RELEASE_TAG}-x86_64-pc-windows-msvc.zip.sha256"
+          )
+          gh release create "$RELEASE_TAG" "${release_files[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "mcp-loadtest ${RELEASE_TAG}" \
+            --notes-file "$notes"
+
+          draft="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          test "$draft" = "true" || {
+            echo "::error::${RELEASE_TAG} was not created as a draft"
+            exit 1
+          }
+
+          # Validate the GitHub-hosted draft, rather than trusting the local
+          # files that were passed to `gh release create`.
+          expected_assets="$RUNNER_TEMP/expected-release-assets.txt"
+          actual_assets="$RUNNER_TEMP/actual-release-assets.txt"
+          asset_inventory="$RUNNER_TEMP/release-asset-inventory.tsv"
+          expected_asset_names=("${release_files[@]##*/}")
+          test "${#expected_asset_names[@]}" -eq 8
+          printf '%s\n' "${expected_asset_names[@]}" | LC_ALL=C sort >"$expected_assets"
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '.assets[] | [.name, (.size | tostring)] | @tsv' \
+            >"$asset_inventory"
+          cut -f1 "$asset_inventory" | LC_ALL=C sort >"$actual_assets"
+          if ! diff -u "$expected_assets" "$actual_assets"; then
+            echo "::error::draft release asset names do not match the expected eight-file set"
+            exit 1
+          fi
+          while IFS=$'\t' read -r asset_name asset_size extra; do
+            if test -n "${extra:-}" ||
+              [[ ! "$asset_size" =~ ^[0-9]+$ ]] ||
+              test "$asset_size" -le 0; then
+              echo "::error::draft asset ${asset_name:-<unknown>} has invalid size ${asset_size:-<missing>}"
+              exit 1
+            fi
+          done <"$asset_inventory"
+
+          downloaded_assets="$(mktemp -d "$RUNNER_TEMP/release-assets.XXXXXX")"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$downloaded_assets"
+          find "$downloaded_assets" -maxdepth 1 -type f -printf '%f\n' |
+            LC_ALL=C sort >"$actual_assets"
+          if ! diff -u "$expected_assets" "$actual_assets"; then
+            echo "::error::downloaded draft assets do not match the expected eight-file set"
+            exit 1
+          fi
+          for asset_name in "${expected_asset_names[@]}"; do
+            test -s "$downloaded_assets/$asset_name" || {
+              echo "::error::downloaded draft asset ${asset_name} is empty"
+              exit 1
+            }
+            api_size="$(awk -F '\t' -v name="$asset_name" '$1 == name { print $2 }' "$asset_inventory")"
+            downloaded_size="$(stat -c '%s' "$downloaded_assets/$asset_name")"
+            test "$downloaded_size" = "$api_size" || {
+              echo "::error::downloaded size for ${asset_name} does not match GitHub asset metadata"
+              exit 1
+            }
+            cmp -s "dist/$asset_name" "$downloaded_assets/$asset_name" || {
+              echo "::error::downloaded draft asset ${asset_name} differs from the verified build artifact"
+              exit 1
+            }
+          done
+          for asset_name in "${expected_asset_names[@]}"; do
+            case "$asset_name" in
+              *.sha256) continue ;;
+            esac
+            checksum_file="${asset_name}.sha256"
+            test "$(wc -l <"$downloaded_assets/$checksum_file")" -eq 1 || {
+              echo "::error::uploaded checksum ${checksum_file} must contain exactly one record"
+              exit 1
+            }
+            read -r checksum_digest checksum_target checksum_extra \
+              <"$downloaded_assets/$checksum_file"
+            if [[ ! "$checksum_digest" =~ ^[0-9a-f]{64}$ ]] ||
+              test "$checksum_target" != "$asset_name" ||
+              test -n "${checksum_extra:-}"; then
+              echo "::error::uploaded checksum ${checksum_file} has an invalid record"
+              exit 1
+            fi
+            (cd "$downloaded_assets" && sha256sum -c --strict "$checksum_file")
+          done
+
+          # Re-check the immutable release identity immediately before making
+          # the fully verified draft public.
+          git fetch --force origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          test "$(git rev-parse HEAD)" = "$APPROVED_SHA"
+          test "$(git cat-file -t "$RELEASE_TAG")" = "tag"
+          test "$(git rev-parse "$RELEASE_TAG")" = "$APPROVED_TAG_OBJECT_SHA" || {
+            echo "::error::annotated tag object ${RELEASE_TAG} moved before publication"
+            exit 1
+          }
+          test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$APPROVED_SHA" || {
+            echo "::error::${RELEASE_TAG} moved before publication"
+            exit 1
+          }
+          test -n "$IMMUTABLE_RELEASES_AUDIT_TOKEN" || {
+            echo "::error::missing immutable-release audit credential before publication"
+            exit 1
+          }
+          immutable_enabled="$(
+            GH_TOKEN="$IMMUTABLE_RELEASES_AUDIT_TOKEN" \
+              gh api "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq '.enabled'
+          )"
+          test "$immutable_enabled" = "true" || {
+            echo "::error::GitHub immutable releases were disabled before publication"
+            exit 1
+          }
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false

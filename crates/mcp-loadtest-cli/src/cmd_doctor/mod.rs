@@ -73,9 +73,22 @@ impl CheckResult {
 /// for the `initialize` smoke; omitted entirely when `None`. `runs_dir` is
 /// the directory scanned for stale-run accumulation.
 pub async fn run_doctor(server: Option<String>, runs_dir: PathBuf) -> Result<()> {
+    run_doctor_with_redaction(server, runs_dir, false).await
+}
+
+/// Run diagnostics while optionally redacting the server command and argv.
+///
+/// The redacted mode is reserved for the composite Action. It also discards
+/// the child server's stderr because a child can print its own process argv.
+/// Ordinary callers should use [`run_doctor`] for self-describing output.
+pub async fn run_doctor_with_redaction(
+    server: Option<String>,
+    runs_dir: PathBuf,
+    redact_server_identity: bool,
+) -> Result<()> {
     let results = vec![
         python::check().await,
-        server::check(server.as_deref()).await,
+        server::check(server.as_deref(), redact_server_identity).await,
         runs::check(&runs_dir).await,
         toolchain::check().await,
     ];

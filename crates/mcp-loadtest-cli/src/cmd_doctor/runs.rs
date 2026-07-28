@@ -3,9 +3,9 @@
 //! Every run writes a `runs/<ulid>/` directory; nothing prunes them. Over a
 //! long CI life this silently fills the disk. Flag it when there are too
 //! many run directories *or* the tree is too large. Best-effort and
-//! **bounded**: one level of run dirs, one level of files inside each — we
-//! never recurse arbitrarily deep (a pathological tree must not turn a
-//! diagnostic into a stall).
+//! **bounded**: one level of run dirs plus immediate files in their one-level
+//! artifact subdirectories (for example `server-stderr/`). We never recurse
+//! arbitrarily deep.
 
 use std::path::Path;
 
@@ -44,7 +44,7 @@ pub(super) async fn check(runs_dir: &Path) -> CheckResult {
             continue;
         }
         dir_count += 1;
-        total_bytes = total_bytes.saturating_add(dir_size_one_level(&entry.path()).await);
+        total_bytes = total_bytes.saturating_add(dir_size_bounded(&entry.path()).await);
     }
 
     let too_many = dir_count > MAX_RUN_DIRS;
@@ -71,19 +71,35 @@ pub(super) async fn check(runs_dir: &Path) -> CheckResult {
     }
 }
 
-/// Sum the size of the immediate files inside one run directory (one level —
-/// run dirs are flat: `metrics.json`, `trace.jsonl`, `server-stderr.log`,
-/// …). Nested subdirs are *counted but not descended* to keep this bounded.
-async fn dir_size_one_level(dir: &Path) -> u64 {
+/// Sum immediate run files and immediate files in one artifact-directory
+/// level. This includes per-session `server-stderr/*.log` evidence while
+/// remaining bounded against arbitrary nested trees.
+async fn dir_size_bounded(dir: &Path) -> u64 {
     let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
         return 0;
     };
     let mut size = 0u64;
     while let Ok(Some(e)) = rd.next_entry().await {
-        if let Ok(meta) = e.metadata().await
-            && meta.is_file()
-        {
+        let Ok(meta) = e.metadata().await else {
+            continue;
+        };
+        if meta.is_file() {
             size = size.saturating_add(meta.len());
+            continue;
+        }
+        if !meta.is_dir() {
+            continue;
+        }
+
+        let Ok(mut nested) = tokio::fs::read_dir(e.path()).await else {
+            continue;
+        };
+        while let Ok(Some(nested_entry)) = nested.next_entry().await {
+            if let Ok(nested_meta) = nested_entry.metadata().await
+                && nested_meta.is_file()
+            {
+                size = size.saturating_add(nested_meta.len());
+            }
         }
     }
     size
@@ -133,5 +149,30 @@ mod tests {
         let r = check(tmp.path()).await;
         assert!(r.ok);
         assert!(r.detail.contains("0 run dir"));
+    }
+
+    #[tokio::test]
+    async fn bounded_size_includes_per_session_stderr_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let run = tmp.path().join("run");
+        let stderr = run.join("server-stderr");
+        tokio::fs::create_dir_all(&stderr)
+            .await
+            .expect("create stderr artifact directory");
+        tokio::fs::write(run.join("metrics.json"), vec![0u8; 3])
+            .await
+            .expect("write root artifact");
+        tokio::fs::write(stderr.join("session-000001.log"), vec![0u8; 5])
+            .await
+            .expect("write worker artifact");
+        let ignored = stderr.join("deeper");
+        tokio::fs::create_dir_all(&ignored)
+            .await
+            .expect("create deeper directory");
+        tokio::fs::write(ignored.join("ignored.log"), vec![0u8; 7])
+            .await
+            .expect("write deeper artifact");
+
+        assert_eq!(dir_size_bounded(&run).await, 8);
     }
 }

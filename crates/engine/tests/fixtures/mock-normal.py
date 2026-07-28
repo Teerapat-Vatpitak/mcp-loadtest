@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mock-normal: echoes args, responds in 1ms. Reference implementation."""
+"""mock-normal: echoes args and rejects malformed JSON without exiting."""
 
 import json
 import pathlib
@@ -28,17 +28,29 @@ TOOLS = [
 def main():
     protocol_version = cli_protocol_version()
     while True:
-        msg = read_frame()
+        try:
+            msg = read_frame()
+        except json.JSONDecodeError:
+            # A normal JSON-RPC server must reject malformed JSON instead of
+            # crashing. Keeping the process alive also makes the raw-fuzzer
+            # reaction observable as an explicit -32700 response rather than
+            # an OS-scheduling race between child exit/EOF and its probe
+            # deadline.
+            respond_error(None, -32700, "parse error")
+            continue
         if msg is None:
             return  # stdin closed
         method = msg.get("method")
         msg_id = msg.get("id")
         is_notification = msg_id is None
 
+        # JSON-RPC notifications never receive a response. In particular, a
+        # raw fuzzer frame containing `tools/list` but no id must not produce
+        # a success envelope with `"id": null`.
+        if is_notification:
+            continue
         if method == "initialize":
             respond_initialize(msg_id, protocol_version=protocol_version)
-        elif method == "notifications/initialized":
-            pass  # one-way notification, no response
         elif method == "tools/list":
             respond_tools_list(msg_id, TOOLS)
         elif method == "tools/call":
@@ -46,7 +58,7 @@ def main():
             respond_ok(msg_id, {
                 "content": [{"type": "text", "text": json.dumps(args)}],
             })
-        elif not is_notification:
+        else:
             respond_error(msg_id, -32601, f"method not found: {method}")
 
 

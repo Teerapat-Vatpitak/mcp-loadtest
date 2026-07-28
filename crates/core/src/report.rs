@@ -49,15 +49,61 @@ pub struct Report {
 }
 
 impl Report {
-    /// True if the run is overall successful: every configured threshold
-    /// satisfied **and** no deadlocks were detected.
+    /// True if the run is overall successful.
     ///
-    /// Deadlock detection is treated as a fail signal regardless of whether
-    /// the user configured thresholds — there's no "expected deadlocks"
-    /// budget. Drives the FAIL banner in the terminal/markdown reporters
-    /// and the non-zero exit code in the CLI.
+    /// Configured thresholds remain the policy for partial application-level
+    /// errors. A few conditions are unconditional correctness failures:
+    ///
+    /// - the scenario attempted no calls;
+    /// - no attempted call produced a scenario-level success;
+    /// - the scenario claimed more successes than attempts;
+    /// - a deadlock or response divergence was detected;
+    /// - any pooled worker failed to complete, so requested concurrency was
+    ///   not actually exercised;
+    /// - any session/transport teardown failed or exceeded its lifecycle
+    ///   deadline;
+    /// - a race check, deadlock probe, or fuzzer produced any unexpected
+    ///   error or breached the configured hang threshold (a diagnostic cohort
+    ///   cannot be called healthy when one member errored or responded late);
+    ///   or
+    /// - the recorder observed a deadlock, timeout, protocol/malformed
+    ///   response, crash, disconnect, or cancellation.
+    ///
+    /// These guardrails prevent an invalid/no-op workload or a dead session
+    /// from producing a green CI result merely because no thresholds were
+    /// configured.
     pub fn passed(&self) -> bool {
-        self.threshold_violations.is_empty() && self.scenario_outcome.deadlock_count == 0
+        let outcome = &self.scenario_outcome;
+        let recorded = &self.metrics.outcomes;
+        // Use a predicate instead of summing untrusted/deserialized counters:
+        // a wrapping release-mode sum could otherwise land back on zero.
+        let has_hard_recorded_failure = [
+            recorded.deadlock,
+            recorded.timeout,
+            recorded.protocol_error,
+            recorded.crash,
+            recorded.malformed,
+            recorded.disconnected,
+            recorded.cancelled,
+        ]
+        .into_iter()
+        .any(|count| count > 0);
+        let diagnostic_complete =
+            !matches!(
+                self.scenario_name.as_str(),
+                "race_check" | "deadlock_probe" | "fuzzer"
+            ) || (outcome.error_count == 0 && outcome.hang_count == 0 && recorded.hang == 0);
+
+        self.threshold_violations.is_empty()
+            && outcome.total_calls > 0
+            && outcome.successful_calls > 0
+            && outcome.successful_calls <= outcome.total_calls
+            && outcome.deadlock_count == 0
+            && outcome.divergence_count == 0
+            && outcome.incomplete_worker_count == 0
+            && outcome.teardown_failure_count == 0
+            && diagnostic_complete
+            && !has_hard_recorded_failure
     }
 }
 
@@ -291,13 +337,157 @@ mod tests {
 
     #[test]
     fn passed_true_when_clean() {
-        let r = skeleton_report();
+        let mut r = skeleton_report();
+        r.scenario_outcome.total_calls = 1;
+        r.scenario_outcome.successful_calls = 1;
         assert!(r.passed());
+    }
+
+    #[test]
+    fn passed_false_when_no_calls_were_attempted() {
+        let r = skeleton_report();
+        assert!(!r.passed());
+    }
+
+    #[test]
+    fn passed_false_when_every_attempt_failed() {
+        let mut r = skeleton_report();
+        r.scenario_outcome.total_calls = 3;
+        r.scenario_outcome.error_count = 3;
+        assert!(!r.passed());
+    }
+
+    #[test]
+    fn passed_false_when_teardown_failed_after_successful_calls() {
+        let mut r = skeleton_report();
+        r.scenario_outcome.total_calls = 3;
+        r.scenario_outcome.successful_calls = 3;
+        r.scenario_outcome.teardown_failure_count = 1;
+        assert!(
+            !r.passed(),
+            "successful calls must not hide an unclean server lifecycle"
+        );
+    }
+
+    #[test]
+    fn passed_false_when_success_count_exceeds_attempts() {
+        let mut r = skeleton_report();
+        r.scenario_outcome.total_calls = 1;
+        r.scenario_outcome.successful_calls = 2;
+        assert!(!r.passed());
+    }
+
+    #[test]
+    fn passed_allows_partial_application_errors_with_no_threshold_violation() {
+        let mut r = skeleton_report();
+        r.scenario_outcome.total_calls = 10;
+        r.scenario_outcome.successful_calls = 9;
+        r.scenario_outcome.error_count = 1;
+        r.metrics.outcomes.server_error = 1;
+        assert!(
+            r.passed(),
+            "partial application errors remain governed by error-rate thresholds"
+        );
+    }
+
+    #[test]
+    fn passed_rejects_incomplete_race_check_even_for_nonterminal_error() {
+        let mut r = skeleton_report();
+        r.scenario_name = "race_check".into();
+        r.scenario_outcome.total_calls = 2;
+        r.scenario_outcome.successful_calls = 2;
+        r.scenario_outcome.error_count = 1;
+        r.metrics.outcomes.server_error = 1;
+        assert!(
+            !r.passed(),
+            "a partial race cohort must not pass as a clean comparison"
+        );
+    }
+
+    #[test]
+    fn passed_rejects_deadlock_probe_error_even_with_surviving_successes() {
+        let mut r = skeleton_report();
+        r.scenario_name = "deadlock_probe".into();
+        r.scenario_outcome.total_calls = 4;
+        r.scenario_outcome.successful_calls = 3;
+        r.scenario_outcome.error_count = 1;
+        r.metrics.outcomes.server_error = 1;
+        assert!(
+            !r.passed(),
+            "a diagnostic probe must not render PASS when one call errored"
+        );
+    }
+
+    #[test]
+    fn passed_rejects_mixed_success_and_slow_diagnostic_cohorts() {
+        for scenario_name in ["race_check", "deadlock_probe", "fuzzer"] {
+            let mut r = skeleton_report();
+            r.scenario_name = scenario_name.into();
+            r.scenario_outcome.total_calls = 2;
+            r.scenario_outcome.successful_calls = 1;
+            r.scenario_outcome.hang_count = 1;
+            r.metrics.outcomes.success = 1;
+            r.metrics.outcomes.hang = 1;
+            assert!(
+                !r.passed(),
+                "{scenario_name} must fail when one diagnostic probe breaches the hang threshold"
+            );
+        }
+    }
+
+    #[test]
+    fn passed_keeps_slow_load_calls_under_threshold_policy() {
+        let mut r = skeleton_report();
+        r.scenario_name = "sustained".into();
+        r.scenario_outcome.total_calls = 2;
+        r.scenario_outcome.successful_calls = 1;
+        r.scenario_outcome.hang_count = 1;
+        r.metrics.outcomes.success = 1;
+        r.metrics.outcomes.hang = 1;
+        assert!(
+            r.passed(),
+            "non-diagnostic load scenarios keep partial slow calls under configured threshold policy"
+        );
+    }
+
+    #[test]
+    fn passed_accepts_expected_fuzzer_rejections_but_rejects_unexpected_errors() {
+        let mut r = skeleton_report();
+        r.scenario_name = "fuzzer".into();
+        r.scenario_outcome.total_calls = 2;
+        r.scenario_outcome.successful_calls = 2;
+        r.metrics.outcomes.expected_rejection = 2;
+        assert!(
+            r.passed(),
+            "expected server rejections are healthy fuzz probes"
+        );
+
+        r.scenario_outcome.total_calls = 3;
+        r.scenario_outcome.error_count = 1;
+        r.metrics.outcomes.server_error = 1;
+        assert!(!r.passed(), "unexpected fuzzer errors must fail closed");
+    }
+
+    #[test]
+    fn passed_rejects_silently_downgraded_pool_for_every_scenario() {
+        let mut r = skeleton_report();
+        r.scenario_name = "sustained".into();
+        r.scenario_outcome.total_calls = 20;
+        r.scenario_outcome.successful_calls = 20;
+        r.scenario_outcome.error_count = 1;
+        r.scenario_outcome.incomplete_worker_count = 1;
+        r.metrics.outcomes.server_error = 1;
+        assert!(
+            !r.passed(),
+            "missing a requested worker must fail even when survivors succeeded"
+        );
     }
 
     #[test]
     fn passed_false_when_thresholds_violated() {
         let mut r = skeleton_report();
+        r.scenario_outcome.total_calls = 1;
+        r.scenario_outcome.successful_calls = 1;
         r.threshold_violations.push(ThresholdViolation {
             kind: ThresholdKind::P99Latency,
             expected: "<= 100ms".into(),
@@ -312,13 +502,70 @@ mod tests {
         // violations, so a deadlock-probe run with no thresholds configured
         // would print PASS while exiting non-zero. Now deadlocks always fail.
         let mut r = skeleton_report();
+        r.scenario_outcome.total_calls = 1;
         r.scenario_outcome.deadlock_count = 1;
         assert!(!r.passed());
     }
 
     #[test]
+    fn passed_false_when_responses_diverge() {
+        let mut r = skeleton_report();
+        r.scenario_outcome.total_calls = 4;
+        r.scenario_outcome.successful_calls = 4;
+        r.scenario_outcome.divergence_count = 1;
+        assert!(!r.passed());
+    }
+
+    #[test]
+    fn passed_false_on_terminal_session_outcome_even_with_successes() {
+        for set_terminal in [
+            |m: &mut ScenarioMetrics| m.outcomes.timeout = 1,
+            |m: &mut ScenarioMetrics| m.outcomes.crash = 1,
+            |m: &mut ScenarioMetrics| m.outcomes.disconnected = 1,
+            |m: &mut ScenarioMetrics| m.outcomes.cancelled = 1,
+        ] {
+            let mut r = skeleton_report();
+            r.scenario_outcome.total_calls = 2;
+            r.scenario_outcome.successful_calls = 1;
+            r.scenario_outcome.error_count = 1;
+            set_terminal(&mut r.metrics);
+            assert!(!r.passed());
+        }
+    }
+
+    #[test]
+    fn passed_false_on_recorded_protocol_correctness_failure() {
+        for set_failure in [
+            |m: &mut ScenarioMetrics| m.outcomes.deadlock = 1,
+            |m: &mut ScenarioMetrics| m.outcomes.protocol_error = 1,
+            |m: &mut ScenarioMetrics| m.outcomes.malformed = 1,
+        ] {
+            let mut r = skeleton_report();
+            r.scenario_outcome.total_calls = 2;
+            r.scenario_outcome.successful_calls = 1;
+            r.scenario_outcome.error_count = 1;
+            set_failure(&mut r.metrics);
+            assert!(!r.passed());
+        }
+    }
+
+    #[test]
+    fn passed_cannot_wrap_adversarial_failure_counters_back_to_zero() {
+        let mut r = skeleton_report();
+        r.scenario_outcome.total_calls = u64::MAX;
+        r.scenario_outcome.successful_calls = 1;
+        r.metrics.outcomes.deadlock = u64::MAX;
+        r.metrics.outcomes.timeout = 1;
+        assert!(
+            !r.passed(),
+            "deserialized failure counters must be tested independently, not summed with wrapping arithmetic"
+        );
+    }
+
+    #[test]
     fn passed_false_when_both_signals_fail() {
         let mut r = skeleton_report();
+        r.scenario_outcome.total_calls = 1;
         r.scenario_outcome.deadlock_count = 1;
         r.threshold_violations.push(ThresholdViolation {
             kind: ThresholdKind::ErrorRate,

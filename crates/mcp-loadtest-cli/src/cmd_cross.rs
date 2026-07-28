@@ -7,8 +7,8 @@
 //! [`mcp_loadtest::analysis::grading::grade`].
 //!
 //! Designed to be invoked from `main.rs` and from integration tests:
-//! `cmd_cross::run(args)` returns the rendered markdown so tests can assert
-//! on it without spawning a subprocess.
+//! `cmd_cross::run(args)` returns both rendered markdown and a gate result so
+//! callers can print the full table before returning a non-zero status.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -73,6 +73,33 @@ pub struct CrossArgs {
     pub scenario: CrossScenario,
     /// Where to put per-run dirs. Defaults to `./runs`.
     pub output_dir: PathBuf,
+    /// Suppress server commands/argv from Action output and diagnostics.
+    /// Ordinary CLI callers leave this false.
+    pub redact_server_identity: bool,
+}
+
+/// Rendered cross-server comparison plus its CI gate signal.
+#[derive(Debug)]
+pub struct CrossOutcome {
+    /// Markdown table, including rows for servers that failed.
+    pub rendered: String,
+    /// Number of servers whose run errored or whose report failed its
+    /// correctness/threshold gate.
+    pub failed_servers: usize,
+}
+
+impl CrossOutcome {
+    /// Return success only when every server produced a passing report.
+    pub fn gate(&self) -> Result<()> {
+        if self.failed_servers == 0 {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "cross comparison failed for {} server(s)",
+                self.failed_servers
+            ))
+        }
+    }
 }
 
 /// One row in the side-by-side comparison: the server command + its [`Report`].
@@ -91,13 +118,18 @@ struct ServerRow {
 /// we record that failure and continue with the rest so the user still sees
 /// the comparison for the servers that did work. Only an *empty* server list
 /// (which clap should reject anyway) bubbles up as an outer error.
-pub async fn run(args: CrossArgs) -> Result<String> {
+pub async fn run(args: CrossArgs) -> Result<CrossOutcome> {
     if args.servers.is_empty() {
         return Err(anyhow!("at least one --server must be provided to `cross`",));
     }
 
-    let args_value: Value = serde_json::from_str(&args.args)
-        .with_context(|| format!("parsing --args JSON: {}", args.args))?;
+    let args_value: Value = if args.redact_server_identity {
+        serde_json::from_str(&args.args)
+            .map_err(|_| anyhow!("parsing --args JSON failed (value redacted by Action)"))?
+    } else {
+        serde_json::from_str(&args.args)
+            .with_context(|| format!("parsing --args JSON: {}", args.args))?
+    };
 
     // Drive servers in parallel — independent processes, no shared state, so
     // running them concurrently cuts wall-clock from `Σ duration` to roughly
@@ -114,13 +146,12 @@ pub async fn run(args: CrossArgs) -> Result<String> {
             let server = server.clone();
             async move {
                 let result = run_one(&server, args_ref, args_value_ref).await;
-                (
-                    idx,
-                    ServerRow {
-                        command: server,
-                        result,
-                    },
-                )
+                let command = if args_ref.redact_server_identity {
+                    format!("server {}", idx + 1)
+                } else {
+                    server
+                };
+                (idx, ServerRow { command, result })
             }
         }))
         .buffer_unordered(MAX_PARALLEL_SERVERS)
@@ -129,14 +160,29 @@ pub async fn run(args: CrossArgs) -> Result<String> {
     rows.sort_by_key(|(idx, _)| *idx);
     let rows: Vec<ServerRow> = rows.into_iter().map(|(_, row)| row).collect();
 
-    Ok(render_markdown(&rows, &args))
+    let failed_servers = rows
+        .iter()
+        .filter(|row| match &row.result {
+            Ok(report) => !report.passed(),
+            Err(_) => true,
+        })
+        .count();
+    Ok(CrossOutcome {
+        rendered: render_markdown(&rows, &args),
+        failed_servers,
+    })
 }
 
 /// Drive a single server through one [`Run`]. Returns the `Report` on success
 /// or a contextualized error.
 async fn run_one(server: &str, args: &CrossArgs, args_value: &Value) -> Result<Report> {
-    let (command, cmd_args) =
-        split_server_command(server).with_context(|| format!("parsing --server `{server}`"))?;
+    let server_parts = split_server_command(server);
+    let (command, cmd_args) = if args.redact_server_identity {
+        server_parts
+            .map_err(|_| anyhow!("parsing --server failed (identity redacted by Action)"))?
+    } else {
+        server_parts.with_context(|| format!("parsing --server `{server}`"))?
+    };
     let server_cfg = ServerConfig::stdio(command, cmd_args);
 
     let scenario: Box<dyn Scenario> = match args.scenario {
@@ -169,11 +215,17 @@ async fn run_one(server: &str, args: &CrossArgs, args_value: &Value) -> Result<R
     let config = Config::new(server_cfg, ScenarioConfig::new(scenario_kind, json!({})))
         .with_output(OutputConfig::new(args.output_dir.clone(), Vec::new()));
 
-    let run = Run::new(config, scenario, args.output_dir.clone());
-    let report = run
-        .execute()
-        .await
-        .with_context(|| format!("running cross workload against `{server}`"))?;
+    let mut run = Run::new(config, scenario, args.output_dir.clone());
+    if args.redact_server_identity {
+        run = run.with_redacted_server_identity();
+    }
+    let report_result = run.execute().await;
+    let report = if args.redact_server_identity {
+        report_result
+            .map_err(|_| anyhow!("cross server run failed (identity redacted by Action)"))?
+    } else {
+        report_result.with_context(|| format!("running cross workload against `{server}`"))?
+    };
     Ok(report)
 }
 

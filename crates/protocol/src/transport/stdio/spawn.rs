@@ -68,6 +68,18 @@ impl StdioTransport {
         } else {
             Stdio::inherit()
         };
+        // Open the artifact before creating the child. This is the only
+        // await in the spawn path; keeping it before Command::spawn makes a
+        // cancelled run-startup deadline unable to strand a live child while
+        // an asynchronous file open is still pending.
+        let capture_file = match &capture_path {
+            None => None,
+            Some(path) => Some(
+                tokio::fs::File::create(path)
+                    .await
+                    .map_err(TransportError::Io)?,
+            ),
+        };
 
         let mut child = Command::new(command)
             .args(args)
@@ -86,16 +98,13 @@ impl StdioTransport {
             .ok_or_else(|| TransportError::Other("child has no stdout".into()))?;
 
         let pump_cancel = CancellationToken::new();
-        let stderr_pump = match capture_path {
+        let stderr_pump = match capture_file {
             None => None,
-            Some(path) => {
+            Some(file) => {
                 let child_stderr = child
                     .stderr
                     .take()
                     .ok_or_else(|| TransportError::Other("child has no stderr".into()))?;
-                let file = tokio::fs::File::create(&path)
-                    .await
-                    .map_err(TransportError::Io)?;
                 let tee = matches!(opts.stderr, StderrMode::TeeToFile(_));
                 Some(spawn_stderr_pump(
                     child_stderr,

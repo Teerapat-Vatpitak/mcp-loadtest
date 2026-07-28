@@ -3,6 +3,13 @@
 Date: 2026-06-12
 Status: Accepted
 
+**Implementation annotation (2026-07-28):** the internal pool is now shared
+by single-tool and multi-pattern sustained workloads. `deadlock_probe` and
+`race_check` use it to complete independent sessions before a synchronized
+one-call-per-worker start gate. For those correctness checks, a direct-library
+context without `SessionFactory` rejects N>1 rather than silently falling back
+to sequential execution.
+
 ## Context
 
 Since M2 every scenario's `concurrent` knob has been **declared, not real**:
@@ -13,7 +20,7 @@ notes ("runs sequentially on one session; concurrent=N is recorded but not
 multiplexed"), and DESIGN §8's N-worker intent stayed backlog (M8+).
 
 M8's prerequisite landed earlier: `RunContext` now carries an optional
-[`SessionFactory`](../../crates/mcp-loadtest/src/run/factory.rs) — a
+[`SessionFactory`](../../crates/engine/src/run/factory.rs) — a
 cloneable handle that spawns a fresh, handshake-complete `Session` for any of
 the four transports. `cold_start` already consumes it. The question: how do
 we turn `concurrent` into real N-client load **without changing the locked
@@ -26,7 +33,9 @@ sequential fallback:
 
 1. A shared `pub(crate)` helper, `scenario::pool::drive_pooled(ctx, n,
 per_worker)`, spawns `n` fresh sessions through `ctx.session_factory`
-   (concurrently, each spawn raced against the cancel token), runs one tokio
+   concurrently. Once a bounded constructor starts, cancellation is observed
+   after it completes so a half-constructed stdio child is never abandoned to
+   Drop-only termination. The helper then runs one tokio
    task per successfully-spawned session executing the caller-supplied worker
    loop, joins **every** handle via `JoinSet`, and merges the per-worker
    `ScenarioOutcome`s (counters summed, `hung_for_ms` appended, notes
@@ -72,13 +81,14 @@ SessionPool, &RunContext)`). Rejected: the trait is locked and public —
   genuine N-client rate (observed: 4 workers completed 12 calls against a
   2s-per-call server in 6s, vs. 3 sequentially); ramp/spike can reuse the
   helper as-is; the honest-notes contract is preserved on every path.
-- **Accepted limitation — process sampling:** the process sampler watches
-  only the **original** server process. For stdio, each pooled session
-  spawns its **own** child server process, so RSS/leak gates see only the
-  first child and miss the pool's memory. Future work: aggregate sampling
-  across pool children (factory would need to surface child PIDs). For
-  network transports (http/sse/ws) all sessions hit the same server process,
-  so sampling stays representative.
+- **Fail-closed limitation — process sampling:** the process sampler watches
+  only the **original** server process. For stdio, each pooled session spawns
+  its **own** child, so the report clears the irrelevant initial-child sample
+  and configured RSS/leak gates emit an unavailable-evidence violation
+  whenever factory sessions were attempted. Future work: aggregate sampling
+  across pool children (factory would need to surface child PIDs). For network
+  transports (http/sse/ws), process metrics are unavailable unless a future
+  remote sampler is added, and configured process gates already fail closed.
 - **Cost commitment:** the pooled path pays N spawn+handshakes at scenario
   start, _inside_ the configured duration (the deadline is anchored before
   the spawn phase, mirroring when the sequential clock starts). For stdio

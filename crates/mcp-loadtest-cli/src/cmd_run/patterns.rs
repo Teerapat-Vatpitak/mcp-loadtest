@@ -80,6 +80,7 @@ fn parse_pattern_array(v: &Value) -> Result<Vec<Pattern>> {
             steps,
         });
     }
+    require_selectable_pattern(&patterns)?;
     Ok(patterns)
 }
 
@@ -103,7 +104,21 @@ fn parse_tool_call_array(v: &Value) -> Result<Vec<Pattern>> {
             steps: vec![step],
         });
     }
+    require_selectable_pattern(&patterns)?;
     Ok(patterns)
+}
+
+fn require_selectable_pattern(patterns: &[Pattern]) -> Result<()> {
+    if patterns
+        .iter()
+        .any(|pattern| pattern.weight.is_finite() && pattern.weight > 0.0)
+    {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "scenario.patterns must contain at least one finite positive weight"
+        ))
+    }
 }
 
 fn parse_steps(v: &Value, path: &str) -> Result<Vec<PatternStep>> {
@@ -191,5 +206,17 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.to_string().contains("on_step_error"));
+    }
+
+    #[test]
+    fn all_non_positive_weights_are_rejected() {
+        let err = parse_patterns(&json!({
+            "patterns": [
+                { "weight": 0.0, "steps": [{ "tool": "echo" }] },
+                { "weight": -1.0, "steps": [{ "tool": "echo" }] }
+            ]
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("positive weight"), "got {err:#}");
     }
 }

@@ -61,7 +61,7 @@ pub(crate) enum Cmd {
         /// Path to the TOML config file.
         #[arg(short, long)]
         config: PathBuf,
-        /// Capture the server's stderr to `runs/<id>/server-stderr.log`
+        /// Capture stderr to per-session files below `runs/<id>/`
         /// instead of inheriting it. No-op for http/sse/ws. See ADR 0013.
         #[arg(long)]
         capture_stderr: bool,
@@ -74,6 +74,12 @@ pub(crate) enum Cmd {
         /// Secret-looking tool arguments are redacted (ADR 0021).
         #[arg(long)]
         trace: Option<PathBuf>,
+        /// Private report-root override reserved for the composite Action.
+        #[arg(long, hide = true)]
+        action_output_dir: Option<PathBuf>,
+        /// Suppress server identity from Action-generated output.
+        #[arg(long, hide = true)]
+        action_redact_server_identity: bool,
     },
 
     /// Diagnose common setup problems; print a ✅/❌ checklist with a
@@ -87,6 +93,9 @@ pub(crate) enum Cmd {
         /// Directory scanned for stale run accumulation.
         #[arg(long, default_value = "./runs")]
         runs_dir: PathBuf,
+        /// Suppress server identity from Action-generated output.
+        #[arg(long, hide = true)]
+        action_redact_server_identity: bool,
     },
 
     /// Compare two `metrics.json` reports and emit a regression diff.
@@ -138,8 +147,8 @@ pub(crate) enum Cmd {
         /// Tool name to call.
         #[arg(long, default_value = "echo")]
         tool: String,
-        /// Number of sequential `tools/call` probes (quick default; the
-        /// `run` config form of this scenario defaults to 20).
+        /// Number of synchronized independent-session `tools/call` probes
+        /// (quick default; the `run` config form defaults to 20).
         #[arg(long, default_value_t = 5)]
         concurrent: u32,
         /// Per-call hang threshold (humantime: `2s`, `500ms`, ...).
@@ -154,6 +163,9 @@ pub(crate) enum Cmd {
         /// Where to write the per-run dir.
         #[arg(long, default_value = "./runs")]
         output_dir: PathBuf,
+        /// Suppress server identity from Action-generated output.
+        #[arg(long, hide = true)]
+        action_redact_server_identity: bool,
     },
 
     /// Run the same workload against N servers and emit a side-by-side comparison.
@@ -178,6 +190,9 @@ pub(crate) enum Cmd {
         /// is printed to stdout.
         #[arg(long, default_value = "./runs")]
         output_dir: PathBuf,
+        /// Suppress server identities from Action-generated output.
+        #[arg(long, hide = true)]
+        action_redact_server_identity: bool,
     },
 
     /// Expose mcp-loadtest itself AS an MCP server over stdio.

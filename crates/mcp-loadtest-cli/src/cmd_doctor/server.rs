@@ -16,22 +16,34 @@ use super::CheckResult;
 const NAME: &str = "server initialize smoke";
 const FIX: &str = "the server failed to initialize — see the captured stderr above; \
                     verify the command and that its dependencies are installed";
-/// Handshake budget. Slightly above `Session`'s own 10s startup timeout so a
-/// server that *just* makes it still counts as a pass rather than a doctor
-/// timeout race.
-const SMOKE_TIMEOUT: Duration = Duration::from_secs(12);
+const REDACTED_FIX: &str = "the server failed to initialize — verify the command and use environment variables for credentials";
+const TEARDOWN_FIX: &str =
+    "the server initialized but did not shut down cleanly — inspect its lifecycle handlers";
+/// Whole constructor budget. This must exceed `Session`'s 10s startup budget
+/// plus its 15s failed-startup cleanup guard; otherwise doctor could cancel
+/// explicit teardown and fall back to an unproven Drop-only kill.
+const SMOKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Margin above stdio's composed internal shutdown phase budget.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 /// How many trailing stderr lines to echo on failure.
 const STDERR_TAIL_LINES: usize = 20;
 
 /// Run the initialize smoke against `server` (a shell-style command string).
 /// `None` → nothing to probe → pass.
-pub(super) async fn check(server: Option<&str>) -> CheckResult {
+pub(super) async fn check(server: Option<&str>, redact_server_identity: bool) -> CheckResult {
     let Some(server) = server else {
         return CheckResult::pass(NAME, "skipped (no --server given)");
     };
 
     let (command, args) = match split_server_command(server) {
         Ok(parts) => parts,
+        Err(_) if redact_server_identity => {
+            return CheckResult::fail(
+                NAME,
+                "could not parse --server (identity redacted by Action)",
+                REDACTED_FIX,
+            );
+        }
         Err(e) => {
             return CheckResult::fail(
                 NAME,
@@ -42,11 +54,15 @@ pub(super) async fn check(server: Option<&str>) -> CheckResult {
     };
 
     // Unique temp file for the captured stderr; cleaned up before we return.
-    let stderr_path = std::env::temp_dir().join(format!(
-        "mcp-loadtest-doctor-{}-{}.stderr.log",
-        std::process::id(),
-        ulid_like()
-    ));
+    let stderr_path = if redact_server_identity {
+        std::path::PathBuf::from(if cfg!(windows) { "NUL" } else { "/dev/null" })
+    } else {
+        std::env::temp_dir().join(format!(
+            "mcp-loadtest-doctor-{}-{}.stderr.log",
+            std::process::id(),
+            ulid_like()
+        ))
+    };
     let opts = SpawnOptions::capture_stderr(&stderr_path);
 
     let outcome =
@@ -54,15 +70,56 @@ pub(super) async fn check(server: Option<&str>) -> CheckResult {
 
     let result = match outcome {
         Ok(Ok(session)) => {
-            // Handshake succeeded. Close it cleanly; a shutdown hiccup is not
-            // an initialize failure, so it doesn't fail the check.
-            let _ = session.shutdown().await;
-            CheckResult::pass(NAME, format!("`{server}` completed initialize"))
+            // A smoke check is green only when it owns the complete child
+            // lifecycle. Swallowing teardown uncertainty leaves leaked
+            // processes and turns a broken server into a false pass.
+            match tokio::time::timeout(SHUTDOWN_TIMEOUT, session.shutdown()).await {
+                Ok(Ok(())) if redact_server_identity => {
+                    CheckResult::pass(NAME, "server completed initialize (identity redacted)")
+                }
+                Ok(Ok(())) => CheckResult::pass(NAME, format!("`{server}` completed initialize")),
+                Ok(Err(_)) if redact_server_identity => CheckResult::fail(
+                    NAME,
+                    "server initialized but teardown failed (identity redacted by Action)",
+                    REDACTED_FIX,
+                ),
+                Ok(Err(error)) => CheckResult::fail(
+                    NAME,
+                    format!("`{server}` initialized but teardown failed: {error}"),
+                    TEARDOWN_FIX,
+                ),
+                Err(_) if redact_server_identity => CheckResult::fail(
+                    NAME,
+                    format!(
+                        "server initialized but teardown exceeded {SHUTDOWN_TIMEOUT:?} \
+                         (identity redacted by Action)"
+                    ),
+                    REDACTED_FIX,
+                ),
+                Err(_) => CheckResult::fail(
+                    NAME,
+                    format!("`{server}` initialized but teardown exceeded {SHUTDOWN_TIMEOUT:?}"),
+                    TEARDOWN_FIX,
+                ),
+            }
         }
+        Ok(Err(_)) if redact_server_identity => CheckResult::fail(
+            NAME,
+            "initialize failed (server identity and stderr redacted by Action)",
+            REDACTED_FIX,
+        ),
         Ok(Err(e)) => {
             let tail = read_stderr_tail(&stderr_path).await;
             CheckResult::fail(NAME, format!("initialize failed: {e}{tail}"), FIX)
         }
+        Err(_) if redact_server_identity => CheckResult::fail(
+            NAME,
+            format!(
+                "server did not initialize within {SMOKE_TIMEOUT:?} \
+                 (identity and stderr redacted by Action)"
+            ),
+            REDACTED_FIX,
+        ),
         Err(_) => {
             let tail = read_stderr_tail(&stderr_path).await;
             CheckResult::fail(
@@ -74,7 +131,9 @@ pub(super) async fn check(server: Option<&str>) -> CheckResult {
     };
 
     // Best-effort cleanup of the temp capture file.
-    let _ = tokio::fs::remove_file(&stderr_path).await;
+    if !redact_server_identity {
+        let _ = tokio::fs::remove_file(&stderr_path).await;
+    }
     result
 }
 
@@ -113,14 +172,14 @@ mod tests {
 
     #[tokio::test]
     async fn no_server_is_a_skip_pass() {
-        let r = check(None).await;
+        let r = check(None, false).await;
         assert!(r.ok);
         assert!(r.detail.contains("skipped"));
     }
 
     #[tokio::test]
     async fn missing_server_binary_fails_with_fix() {
-        let r = check(Some("no-such-binary-zzzz-doctor")).await;
+        let r = check(Some("no-such-binary-zzzz-doctor"), false).await;
         assert!(!r.ok, "a missing server binary must fail the smoke");
         assert!(r.fix.is_some());
         assert!(r.detail.contains("initialize failed"));
@@ -128,8 +187,17 @@ mod tests {
 
     #[tokio::test]
     async fn unparseable_server_string_fails() {
-        let r = check(Some("   ")).await;
+        let r = check(Some("   "), false).await;
         assert!(!r.ok);
         assert!(r.detail.contains("could not parse"));
+    }
+
+    #[tokio::test]
+    async fn action_mode_spawn_error_omits_server_identity() {
+        let sentinel = "no-such-ACTION_SERVER_SECRET_7F3B";
+        let r = check(Some(sentinel), true).await;
+        assert!(!r.ok);
+        assert!(!r.detail.contains(sentinel), "detail leaked: {}", r.detail);
+        assert!(r.detail.contains("redacted"), "detail: {}", r.detail);
     }
 }

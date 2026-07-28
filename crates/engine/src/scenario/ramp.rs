@@ -165,11 +165,16 @@ impl Scenario for Ramp {
                 step_iters += 1;
 
                 match result {
-                    Ok(_) => {
-                        outcome.successful_calls += 1;
-                        ctx.metrics
-                            .record_tool(&self.tool, elapsed, CallOutcome::Success);
-                        step_recorder.record(elapsed, CallOutcome::Success);
+                    Ok(result) => {
+                        let kind = if super::is_logical_tool_error(&result) {
+                            outcome.error_count += 1;
+                            CallOutcome::ServerError
+                        } else {
+                            outcome.successful_calls += 1;
+                            CallOutcome::Success
+                        };
+                        ctx.metrics.record_tool(&self.tool, elapsed, kind);
+                        step_recorder.record(elapsed, kind);
                     }
                     Err(err) => {
                         outcome.error_count += 1;

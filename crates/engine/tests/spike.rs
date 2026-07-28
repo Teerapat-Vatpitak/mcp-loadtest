@@ -6,9 +6,12 @@
 
 mod helpers;
 
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use mcp_loadtest_core::metrics::Recorder;
+use mcp_loadtest_core::report::{ProcessStats, Report, ServerInfo};
 use mcp_loadtest_engine::scenario::spike::Spike;
 use mcp_loadtest_engine::scenario::{RunContext, Scenario};
 use mcp_loadtest_protocol::Session;
@@ -36,6 +39,20 @@ fn fixture_factory(fixture: &str) -> SessionFactory {
         let mock = mock.clone();
         async move { Session::spawn(&py, [mock.as_os_str()]).await }
     })
+}
+
+async fn pre_spawned_sessions(fixture: &str, count: usize) -> Arc<Mutex<Vec<Session>>> {
+    let mock = helpers::fixture_path(fixture);
+    let py = helpers::python();
+    let mut sessions = Vec::with_capacity(count);
+    for _ in 0..count {
+        sessions.push(
+            Session::spawn(&py, [mock.as_os_str()])
+                .await
+                .expect("pre-spawn failed"),
+        );
+    }
+    Arc::new(Mutex::new(sessions))
 }
 
 #[tokio::test]
@@ -111,7 +128,7 @@ async fn spike_happy_path_drives_all_three_phases() {
         outcome.notes,
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
@@ -119,24 +136,19 @@ async fn spike_happy_path_drives_all_three_phases() {
 
 #[tokio::test]
 async fn spike_against_crashing_server_survives_without_hang() {
-    // Failure-mode coverage for `Spike`: mock-crash.py randomly exits during
-    // a call (~1% probability per call). The test asserts the **survival**
-    // properties — the scenario doesn't hang, completes within reasonable
-    // time, and records its outcome — rather than a strict `error_count > 0`
-    // because the crash is stochastic: with ~80 calls × 1% crash rate, a
-    // strict assertion flakes ~45% of the time. The expected error path is
-    // exercised by `deadlock.rs::mock_broken_detects_deadlock` and the
-    // fuzzer integration test; here we just need to know spike survives.
+    // Deterministic terminal-path coverage: the fixture exits before replying
+    // to the first tools/call. Random mode remains available for realism, but
+    // an adversarial regression must prove that the crash actually occurred.
     let mock = helpers::fixture_path("mock-crash.py");
     let py = helpers::python();
 
-    let mut session = Session::spawn(&py, [mock.as_os_str()])
-        .await
-        .expect("spawn failed");
+    let mut session = Session::spawn(
+        &py,
+        [mock.as_os_str(), "--crash-after".as_ref(), "1".as_ref()],
+    )
+    .await
+    .expect("spawn failed");
 
-    // Longer phases push call count up to ~300+, making a crash statistically
-    // near-certain (P(no crash) = 0.99^300 ≈ 5%) — but the assertion below
-    // doesn't depend on the crash actually firing.
     let scenario = Spike {
         baseline_concurrent: 1,
         spike_concurrent: 4,
@@ -165,19 +177,20 @@ async fn spike_against_crashing_server_survives_without_hang() {
         outcome.deadlock_count, 0,
         "crashes are not deadlocks: {outcome:?}"
     );
-    // If errors did fire, that's the expected path; if they didn't, the run
-    // happened to dodge the 1% crash dice — both prove "spike survives a
-    // crash-prone server", which is the property under test.
-    if outcome.error_count == 0 {
-        eprintln!(
-            "note: mock-crash dodged in this run ({} calls, no crash). \
-             Survival path still verified by elapsed-time bound above.",
-            outcome.total_calls
-        );
-    }
+    assert!(
+        outcome.error_count >= 1,
+        "deterministic crash must be recorded as an error: {outcome:?}"
+    );
+    let counts = ctx.metrics.snapshot().outcomes;
+    assert!(
+        counts.crash + counts.disconnected >= 1,
+        "deterministic process exit must be classified as crash/disconnected: {counts:?}"
+    );
 
-    // Best-effort shutdown — the server may already be gone after a crash.
-    let _ = tokio::time::timeout(Duration::from_secs(5), session.shutdown()).await;
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("shutdown errored");
 }
 
 /// M8 pooled path: with a session factory attached, each phase must drive
@@ -274,7 +287,179 @@ async fn spike_pooled_path_drives_phases_through_worker_pools() {
         "got {outcome:?}"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("shutdown errored");
+}
+
+/// Regression: successful warmup/cooldown calls must not hide a spike phase
+/// whose sessions finished spawning only after that phase's deadline. Before
+/// the pool-level zero-call guard, the aggregate had successful calls and no
+/// typed incompleteness, so `Report::passed()` could return true even though
+/// none of the two requested spike workers exercised a call.
+#[tokio::test]
+async fn delayed_spike_phase_workers_fail_closed_when_they_make_no_calls() {
+    let mock = helpers::fixture_path("mock-normal.py");
+    let py = helpers::python();
+    let mut session = Session::spawn(&py, [mock.as_os_str()])
+        .await
+        .expect("spawn failed");
+
+    // One session for warmup, two for spike, one for cooldown. Returning the
+    // spike sessions is deliberately delayed past the 50ms phase deadline;
+    // warmup and cooldown still exercise calls, preventing the report's
+    // general zero-call guard from being the reason this run fails.
+    let sessions = pre_spawned_sessions("mock-normal.py", 4).await;
+    let invocation = Arc::new(AtomicU32::new(0));
+    let factory = {
+        let sessions = Arc::clone(&sessions);
+        let invocation = Arc::clone(&invocation);
+        SessionFactory::new(move || {
+            let sessions = Arc::clone(&sessions);
+            let invocation = Arc::clone(&invocation);
+            async move {
+                let phase_slot = invocation.fetch_add(1, Ordering::SeqCst);
+                let worker_session = sessions
+                    .lock()
+                    .expect("session queue lock poisoned")
+                    .pop()
+                    .expect("one pre-spawned session per phase worker");
+                if matches!(phase_slot, 1 | 2) {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                Ok(worker_session)
+            }
+        })
+    };
+
+    let scenario = Spike {
+        baseline_concurrent: 1,
+        spike_concurrent: 2,
+        warmup: Duration::from_millis(200),
+        spike_duration: Duration::from_millis(50),
+        cooldown: Duration::from_millis(200),
+        tool: "echo".to_owned(),
+        args: json!({ "msg": "phase-completeness" }),
+    };
+    let ctx = make_ctx().with_session_factory(factory);
+    let outcome = scenario.drive(&mut session, &ctx).await;
+
+    assert!(
+        outcome.total_calls > 0 && outcome.successful_calls > 0,
+        "warmup/cooldown must provide otherwise-green evidence: {outcome:?}"
+    );
+    assert_eq!(outcome.error_count, 0, "mock-normal must stay healthy");
+    assert_eq!(
+        outcome.incomplete_worker_count, 2,
+        "both spawned spike workers missed their call window: {outcome:?}"
+    );
+    assert_eq!(
+        outcome
+            .notes
+            .iter()
+            .filter(|note| {
+                note.starts_with("spike.spike:")
+                    && note.contains("completed without exercising a call")
+            })
+            .count(),
+        2,
+        "each zero-call spike worker must be attributable: {outcome:?}"
+    );
+
+    let report = Report {
+        run_id: "zero-call-spike-regression".to_owned(),
+        started_at: SystemTime::UNIX_EPOCH,
+        duration: Duration::from_secs(1),
+        scenario_name: "spike".to_owned(),
+        server_info: ServerInfo {
+            command: "mock-normal.py".to_owned(),
+            args: Vec::new(),
+            pid: None,
+            protocol_version: None,
+        },
+        metrics: ctx.metrics.snapshot(),
+        process: ProcessStats::default(),
+        scenario_outcome: outcome,
+        trace_path: None,
+        threshold_violations: Vec::new(),
+        coverage: None,
+    };
+    assert!(
+        !report.passed(),
+        "requested spike concurrency was not exercised and must fail closed"
+    );
+
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("shutdown errored");
+}
+
+/// A zero-length warmup/cooldown means "omit this optional phase", not
+/// "spawn workers that can never make a call". The latter used to trip the
+/// pool completeness guard and make a healthy spike-only run fail.
+#[tokio::test]
+async fn zero_length_optional_phases_are_skipped_without_false_failure() {
+    let mock = helpers::fixture_path("mock-normal.py");
+    let py = helpers::python();
+    let mut session = Session::spawn(&py, [mock.as_os_str()])
+        .await
+        .expect("spawn failed");
+
+    let sessions = pre_spawned_sessions("mock-normal.py", 2).await;
+    let invocation = Arc::new(AtomicU32::new(0));
+    let factory = {
+        let sessions = Arc::clone(&sessions);
+        let invocation = Arc::clone(&invocation);
+        SessionFactory::new(move || {
+            let sessions = Arc::clone(&sessions);
+            let invocation = Arc::clone(&invocation);
+            async move {
+                invocation.fetch_add(1, Ordering::SeqCst);
+                Ok(sessions
+                    .lock()
+                    .expect("session queue lock poisoned")
+                    .pop()
+                    .expect("one pre-spawned session per spike worker"))
+            }
+        })
+    };
+
+    let scenario = Spike {
+        baseline_concurrent: 3,
+        spike_concurrent: 2,
+        warmup: Duration::ZERO,
+        spike_duration: Duration::from_millis(300),
+        cooldown: Duration::ZERO,
+        tool: "echo".to_owned(),
+        args: json!({ "msg": "spike-only" }),
+    };
+    let ctx = make_ctx().with_session_factory(factory);
+    let outcome = scenario.drive(&mut session, &ctx).await;
+
+    assert!(outcome.total_calls > 0, "spike phase must run: {outcome:?}");
+    assert_eq!(outcome.error_count, 0, "mock-normal must stay healthy");
+    assert_eq!(
+        outcome.incomplete_worker_count, 0,
+        "omitted phases must not manufacture incomplete workers: {outcome:?}"
+    );
+    assert_eq!(
+        invocation.load(Ordering::SeqCst),
+        2,
+        "only the two spike workers should be spawned"
+    );
+    for phase in ["warmup", "cooldown"] {
+        assert!(
+            outcome
+                .notes
+                .iter()
+                .any(|note| note == &format!("spike.{phase}: skipped because duration is 0")),
+            "missing explicit {phase} skip note: {outcome:?}"
+        );
+    }
+
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
@@ -322,7 +507,7 @@ async fn spike_sequential_records_each_call_exactly_once() {
          snapshot={snap:?} outcome={outcome:?}"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");

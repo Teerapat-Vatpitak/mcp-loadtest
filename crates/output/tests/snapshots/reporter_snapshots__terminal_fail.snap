@@ -1,14 +1,15 @@
 ---
-source: crates/mcp-loadtest/tests/reporter_snapshots.rs
+source: crates/output/tests/reporter_snapshots.rs
 expression: s
 ---
 mcp-loadtest run summary
-  status:    FAIL (1 threshold violation)
+  status:    FAIL (2 teardown failures, 10 protocol/malformed outcomes, 5 terminal session outcomes, 1 threshold violation)
   server:    python -m vibe_trading_mcp
   scenario:  sustained
   duration:  60.00s
 
   requests:  12,345 total · 12,300 ok · 45 errors (0.36%)
+  teardown failures: 2
   rps:       205.8
 
   latency:

@@ -16,7 +16,7 @@ workspace = true
 tui = ["dep:ratatui", "dep:crossterm"]
 
 [dependencies]
-mcp-loadtest-core = { path = "../core", version = "0.0.1" }
+mcp-loadtest-core = { path = "../core", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

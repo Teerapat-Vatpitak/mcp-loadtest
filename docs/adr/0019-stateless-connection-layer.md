@@ -3,8 +3,35 @@
 Date: 2026-07-07
 Status: Accepted — implemented against the **release candidate** on
 2026-07-07 (user directed full-plan execution ahead of the final spec).
-A reconciliation pass against the final text + RC→final changelog is
-scheduled for 2026-07-29; every "per RC" statement below is re-verified then.
+
+**Final-reconciliation annotation (2026-07-29):** the stable `2026-07-28`
+specification is published at commit
+`5f5440bb26a62e2cf3440b92da5a667efa03b267`. ADR 0023 records the schema
+comparison, final conformance pin, and current claim boundary. The implemented
+tools/discovery/request-metadata/header definitions have no final wire delta;
+the final-only `subscriptions/listen` response-envelope change is not
+implemented. Stateless mode remains explicit and experimental, is limited to
+stdio + Streamable HTTP, and is not a full-protocol claim. The latest official
+conformance pin still identifies this revision as DRAFT/provisional, so it is
+supporting scoped harness evidence rather than the final-spec reconciliation
+proof. This annotation supersedes the pre-final release-truth paragraphs below
+while preserving the RC design record.
+
+**Historical release-truth annotation (2026-07-28; superseded by
+[ADR 0023](0023-mcp-2026-final-reconciliation.md)):** no dated final was available to
+reconcile. The `v0.1.0` candidate therefore labels this path experimental,
+requires an explicit `protocol_version = "2026-07-28"` selection, and pins
+official spec commit `7d6c7b86eb2f1442051849ca76429fde3c3008b0` plus
+conformance commit `49103de6ed70804e940637bf3e9e29e4a3f54e64`. It is not the
+default or a final-spec support promise. The original RC design record remains
+below for history; its `v0.0.1` scope was never released.
+
+The pre-final reconciled candidate sends `MCP-Protocol-Version` on the first
+`server/discover` POST, parses `supportedVersions` / `resultType` / `_meta`,
+fails closed when discovery does not confirm the pinned revision, and mirrors
+the draft's `Mcp-Method`, `Mcp-Name`, and schema-driven `Mcp-Param-*` request
+headers on stateless Streamable HTTP. These points supersede incompatible RC
+details in the historical decision text below.
 
 ## Context
 
@@ -88,7 +115,7 @@ handshake revisions — not replace them.
   become the regression net; `version_matrix` (plan T1.5) spans handshake and
   stateless modes through the same `SessionFactory` seam.
 
-## Open questions (blocked on the final spec, 2026-07-28)
+## Historical open questions (resolved or scoped by ADR 0023)
 
 - Exact `_meta` field names for protocol version / client info / capabilities,
   and whether `MCP-Protocol-Version` HTTP header semantics change.

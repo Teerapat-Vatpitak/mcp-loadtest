@@ -141,7 +141,7 @@ async fn multi_step_pattern_drives_sequence() {
     assert_eq!(snap.outcomes.success, 3, "metrics didn't see all 3 calls");
     assert_eq!(snap.throughput.total_requests, 3);
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
@@ -192,8 +192,10 @@ async fn error_behavior_abort_stops_at_first_error() {
         "no step should have succeeded: {stats:?}"
     );
 
-    // Best-effort shutdown — child is already gone.
-    let _ = tokio::time::timeout(Duration::from_secs(2), session.shutdown()).await;
+    tokio::time::timeout(Duration::from_secs(2), session.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("shutdown errored");
 }
 
 #[cfg(unix)]

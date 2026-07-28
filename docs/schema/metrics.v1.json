@@ -78,7 +78,10 @@
       "required": ["total_requests", "successful_requests", "requests_per_sec"],
       "properties": {
         "total_requests": { "type": "integer" },
-        "successful_requests": { "type": "integer" },
+        "successful_requests": {
+          "type": "integer",
+          "description": "Ordinary successes plus expected protocol-fuzz rejections."
+        },
         "requests_per_sec": {
           "type": "number",
           "description": "Total calls divided by wall-clock run duration; with a session pool this reflects the aggregate N-worker rate."
@@ -130,6 +133,22 @@
     },
     "deadlock_count": { "type": "integer" },
     "hang_count": { "type": "integer" },
+    "divergence_count": {
+      "type": "integer",
+      "description": "Number of identical-input response sets that diverged. Omitted when zero for v1 compatibility."
+    },
+    "incomplete_worker_count": {
+      "type": "integer",
+      "description": "Requested pooled workers that failed to complete. Omitted when zero; any non-zero value makes the run fail."
+    },
+    "teardown_failure_count": {
+      "type": "integer",
+      "description": "Session or transport teardowns that errored or exceeded their lifecycle deadline. Omitted when zero; any non-zero value makes the run fail."
+    },
+    "expected_rejection_count": {
+      "type": "integer",
+      "description": "Malformed fuzz probes rejected or survived as expected. These count as successful requests and are omitted when zero."
+    },
     "trace_path": {
       "type": "string",
       "description": "Path to the per-run trace; omitted when there is none."
@@ -152,7 +171,7 @@
     },
     "passed": {
       "type": "boolean",
-      "description": "No threshold violations AND zero deadlocks."
+      "description": "True only when configured thresholds pass, at least one call succeeds, no deadlock/divergence/incomplete pooled cohort/teardown failure occurs, and no recorded deadlock/timeout/protocol/malformed/crash/disconnect/cancellation occurs."
     }
   }
 }

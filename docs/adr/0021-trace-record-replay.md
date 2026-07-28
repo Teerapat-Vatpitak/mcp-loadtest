@@ -98,9 +98,13 @@ recorded client frames, in recorded order, through a bare freshly-connected
 deliberately bends the "no blocking I/O in async paths" rule: each write is a
 single line appended to a local file (a page-cache write, microseconds), the
 lock is held for exactly one line, and the run's other work is unaffected.
-Recording failures never fail the run — the writer warns once and drops
-subsequent frames. Only the *creation* of the trace file fails the run (an
-explicitly requested artifact that can't be opened is an error).
+An explicitly requested trace is fail-closed. Creation/header failures fail
+the run immediately. Because the transport decorator cannot return a separate
+artifact error alongside a successful server response, the writer latches its
+first frame serialization/write/flush failure, warns once, and drops later
+frames. After every session has shut down, `Run::execute` final-flushes the
+shared writer and returns an error if that latch is set. `Report::trace_path`
+is therefore populated only after the complete trace has finalized.
 
 ## Alternatives considered
 

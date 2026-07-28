@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use mcp_loadtest_core::metrics::{CallOutcome, Recorder};
 use mcp_loadtest_protocol::Session;
 use mcp_loadtest_protocol::SessionFactory;
+use mcp_loadtest_protocol::mcp::CallToolResult;
 use mcp_loadtest_protocol::session::SessionError;
 use mcp_loadtest_protocol::transport::TransportError;
 
@@ -27,6 +28,7 @@ pub mod ramp;
 pub mod soak;
 pub mod spike;
 pub mod sustained;
+pub(crate) mod teardown;
 pub mod version_matrix;
 
 /// A workload scenario that drives an MCP `Session` and records metrics.
@@ -131,8 +133,21 @@ pub(crate) fn classify_error(err: &SessionError) -> CallOutcome {
     use SessionError as E;
     use TransportError as T;
     match err {
+        // Standard JSON-RPC failures mean a normal workload did not complete
+        // the protocol exchange it asked for. Keep implementation-defined
+        // `-32000..=-32099` failures in ServerError, but fail closed for the
+        // five standard codes so a permissive error-rate threshold cannot
+        // turn a protocol mismatch into PASS.
+        E::Server(obj) if obj.code == -32700 || (-32603..=-32600).contains(&obj.code) => {
+            CallOutcome::ProtocolError
+        }
         E::Server(_) => CallOutcome::ServerError,
-        E::Json(_) | E::IdMismatch { .. } => CallOutcome::Malformed,
+        E::Json(_) | E::ResponseShape(_) | E::IdMismatch { .. } | E::InvalidResponseId { .. } => {
+            CallOutcome::Malformed
+        }
+        E::MismatchedSuccessResponse { .. } | E::MismatchedErrorResponse { .. } => {
+            CallOutcome::Malformed
+        }
         E::Io(_) => CallOutcome::Disconnected,
         E::Transport(T::Closed) | E::Transport(T::Io(_)) => CallOutcome::Disconnected,
         E::Transport(T::Timeout(_)) | E::StartupTimeout(_) => CallOutcome::Timeout,
@@ -140,6 +155,7 @@ pub(crate) fn classify_error(err: &SessionError) -> CallOutcome {
         // Strict-validation reject: the call never reached the server, the
         // session is healthy — it's a protocol-level mismatch.
         E::SchemaViolation { .. } => CallOutcome::ProtocolError,
+        E::InvalidJsonRpcVersion { .. } => CallOutcome::ProtocolError,
         // Strict-mode version gate (ADR 0018): produced by the run
         // orchestrator at spawn time, so scenario loops normally never see
         // it — but if one does (e.g. a pooled respawn), it's a
@@ -152,6 +168,15 @@ pub(crate) fn classify_error(err: &SessionError) -> CallOutcome {
         // generic server-error bucket rather than failing to compile here.
         _ => CallOutcome::ServerError,
     }
+}
+
+/// Whether a successful JSON-RPC `tools/call` envelope represents an MCP
+/// logical tool failure (`isError: true`).
+///
+/// Every normal workload scenario uses this helper before incrementing
+/// `successful_calls`; otherwise an all-tool-errors workload can report PASS.
+pub(crate) fn is_logical_tool_error(result: &CallToolResult) -> bool {
+    result.is_error
 }
 
 /// `true` when `err` indicates the underlying session is gone and the
@@ -191,6 +216,14 @@ mod tests {
         }
     }
 
+    fn protocol_err(code: i64) -> ErrorObject {
+        ErrorObject {
+            code,
+            message: "standard JSON-RPC error".to_string(),
+            data: None,
+        }
+    }
+
     fn json_err() -> serde_json::Error {
         serde_json::from_str::<Value>("not json").unwrap_err()
     }
@@ -202,14 +235,48 @@ mod tests {
             classify_error(&SessionError::Server(server_err())),
             CallOutcome::ServerError,
         );
+        for code in [-32700, -32600, -32601, -32602, -32603] {
+            assert_eq!(
+                classify_error(&SessionError::Server(protocol_err(code))),
+                CallOutcome::ProtocolError,
+                "standard JSON-RPC code {code} must fail closed",
+            );
+        }
         assert_eq!(
             classify_error(&SessionError::Json(json_err())),
+            CallOutcome::Malformed,
+        );
+        assert_eq!(
+            classify_error(&SessionError::ResponseShape(json_err())),
             CallOutcome::Malformed,
         );
         assert_eq!(
             classify_error(&SessionError::IdMismatch {
                 expected: 1,
                 got: 2,
+            }),
+            CallOutcome::Malformed,
+        );
+        assert_eq!(
+            classify_error(&SessionError::InvalidResponseId {
+                expected: 1,
+                got: Value::Null,
+            }),
+            CallOutcome::Malformed,
+        );
+        assert_eq!(
+            classify_error(&SessionError::MismatchedSuccessResponse {
+                expected: 1,
+                got: json!(2),
+                result: json!({"tools": []}),
+            }),
+            CallOutcome::Malformed,
+        );
+        assert_eq!(
+            classify_error(&SessionError::MismatchedErrorResponse {
+                expected: 1,
+                got: Value::Null,
+                error: protocol_err(-32600),
             }),
             CallOutcome::Malformed,
         );
@@ -232,6 +299,12 @@ mod tests {
             classify_error(&SessionError::UnsupportedProtocolVersion {
                 got: "9999-12-31".to_string(),
                 advertised: "2025-03-26".to_string(),
+            }),
+            CallOutcome::ProtocolError,
+        );
+        assert_eq!(
+            classify_error(&SessionError::InvalidJsonRpcVersion {
+                got: "3.0".to_owned(),
             }),
             CallOutcome::ProtocolError,
         );
@@ -282,9 +355,26 @@ mod tests {
         // Non-terminal: the session may still be usable; worker should not bail.
         assert!(!is_terminal_error(&SessionError::Server(server_err())));
         assert!(!is_terminal_error(&SessionError::Json(json_err())));
+        assert!(!is_terminal_error(&SessionError::ResponseShape(json_err())));
         assert!(!is_terminal_error(&SessionError::IdMismatch {
             expected: 1,
             got: 2,
+        }));
+        assert!(!is_terminal_error(&SessionError::InvalidResponseId {
+            expected: 1,
+            got: Value::Null,
+        }));
+        assert!(!is_terminal_error(
+            &SessionError::MismatchedSuccessResponse {
+                expected: 1,
+                got: json!(2),
+                result: json!({"tools": []}),
+            }
+        ));
+        assert!(!is_terminal_error(&SessionError::MismatchedErrorResponse {
+            expected: 1,
+            got: Value::Null,
+            error: protocol_err(-32600),
         }));
         assert!(!is_terminal_error(&SessionError::Transport(
             TransportError::Timeout(Duration::from_secs(5)),
@@ -298,6 +388,9 @@ mod tests {
         assert!(!is_terminal_error(&SessionError::SchemaViolation {
             tool: "echo".to_string(),
             summary: "args.x: expected type `string`".to_string(),
+        }));
+        assert!(!is_terminal_error(&SessionError::InvalidJsonRpcVersion {
+            got: "3.0".to_owned(),
         }));
     }
 }

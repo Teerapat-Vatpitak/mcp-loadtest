@@ -13,10 +13,11 @@ branding:
 inputs:
   version:
     description: >-
-      Release tag to install (e.g. "v0.0.1"). "latest" resolves the most
-      recent GitHub Release of Teerapat-Vatpitak/mcp-loadtest.
+      Release tag to install (e.g. "v0.1.0"). Defaults to the binary matching
+      this Action release. "latest" may be requested explicitly, but is less
+      reproducible.
     required: false
-    default: "latest"
+    default: "v0.1.0"
   command:
     description: >-
       Subcommand to run: "deadlock-probe" (default), "run", "cross", or
@@ -27,20 +28,28 @@ inputs:
   server:
     description: >-
       Server command string passed to --server, e.g. "python -m my_mcp".
-      Ignored by `command: run` (the TOML config carries the server) but
-      still echoed into the job summary.
+      Ignored by `command: run` (the TOML config carries the server). Do not
+      put credentials here: the value and parsed child argv remain visible to
+      operating-system process inspection. Prefer environment-based auth. The
+      Action redacts server identity from its reports, trace header, summary,
+      diagnostics, and retained stderr, but cannot make process argv secret.
     required: true
   args:
     description: >-
-      Extra CLI args appended verbatim, parsed with shell quoting rules, e.g.
-      --tool get_market_data --args '{"ticker":"AAPL"}'
+      Extra CLI arguments as a JSON array of strings. Each array element is
+      passed as one literal argument; shell syntax is never evaluated. Example:
+      ["--tool","get_market_data","--args","{\"ticker\":\"AAPL\"}"].
+      Output-directory flags are reserved for the Action and rejected. Do not
+      place credentials here: redaction cannot sanitize arbitrary MCP server
+      response content or operating-system process inspection.
     required: false
-    default: ""
+    default: "[]"
   baseline:
     description: >-
       Optional path to a baseline metrics.json. When set, the action also
-      runs `mcp-loadtest compare <baseline> <run>/metrics.json` after the
-      main command and fails on regression.
+      runs `mcp-loadtest compare <baseline> <current>/metrics.json` after a
+      single-report `run` or `deadlock-probe` invocation and fails on
+      regression. Rejected for `cross` (multiple reports) and `doctor` (none).
     required: false
     default: ""
   working-directory:
@@ -51,13 +60,19 @@ inputs:
 outputs:
   report-dir:
     description: >-
-      Directory of the newest run report (contains report.md + metrics.json),
-      e.g. ./runs/<run-id>. Assumes the default ./runs output dir unless
-      --output-dir was overridden via `args`.
+      Exact directory created by this invocation for `run` and
+      `deadlock-probe`; the private Action-owned report root for multi-report
+      `cross`; empty for `doctor`. Never selected from a shared or pre-existing
+      report root.
     value: ${{ steps.run.outputs.report-dir }}
   passed:
-    description: '"true" when the tool (and compare, if any) exited 0, else "false".'
-    value: ${{ steps.run.outputs.passed }}
+    description: >-
+      "true" only when the command, report attribution, and optional compare
+      all pass; "false" on validation, install, execution, discovery, or
+      comparison failure.
+    # `run` is never reached when installation fails. Keep the public output
+    # fail-closed instead of exposing an ambiguous empty value in that case.
+    value: ${{ steps.run.outputs.passed || 'false' }}
 
 runs:
   using: "composite"
@@ -69,6 +84,8 @@ runs:
         INPUT_VERSION: ${{ inputs.version }}
       run: |
         repo="Teerapat-Vatpitak/mcp-loadtest"
+        # shellcheck source=scripts/action-args.sh
+        source "${GITHUB_ACTION_PATH}/scripts/action-args.sh"
 
         # --- resolve the release tag -----------------------------------------
         tag="${INPUT_VERSION}"
@@ -92,7 +109,13 @@ runs:
           echo "::error::could not resolve a release tag for ${repo}"
           exit 1
         fi
-        echo "MCP_LOADTEST_VERSION=${tag}" >> "$GITHUB_ENV"
+        if ! mcp_loadtest_is_release_tag "$tag"; then
+          # Do not interpolate an invalid caller value into workflow-command
+          # output or an environment file.
+          echo "::error::version must resolve to a stable tag such as v0.1.0"
+          exit 2
+        fi
+        printf 'MCP_LOADTEST_VERSION=%s\n' "$tag" >> "$GITHUB_ENV"
 
         # --- map runner -> release target ------------------------------------
         target=""
@@ -119,8 +142,15 @@ runs:
         #   mcp-loadtest-<tag>-<target>.{tar.gz|zip}  (+ ".sha256" sidecar)
         asset="mcp-loadtest-${tag}-${target}.${ext}"
         base="https://github.com/${repo}/releases/download/${tag}"
-        dist="${RUNNER_TEMP}/mcp-loadtest-dist"
-        mkdir -p "$dist"
+        temp_base="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+        if ! dist="$(mktemp -d "${temp_base%/}/mcp-loadtest-dist.XXXXXX")"; then
+          echo "::error::could not create a private install directory"
+          exit 1
+        fi
+        if ! chmod 700 "$dist"; then
+          echo "::error::could not restrict the private install directory"
+          exit 1
+        fi
         cd "$dist"
 
         # Unauthenticated on purpose: release downloads on a public repo need
@@ -170,10 +200,14 @@ runs:
         INPUT_ARGS: ${{ inputs.args }}
         INPUT_BASELINE: ${{ inputs.baseline }}
       run: |
+        # Establish fail-closed outputs before any validation or setup can
+        # return early. Successful completion overwrites these values below.
+        printf 'report-dir=\npassed=false\n' >> "$GITHUB_OUTPUT"
+
         case "${INPUT_COMMAND}" in
           run|deadlock-probe|cross|doctor) ;;
           *)
-            echo "::error::unsupported command '${INPUT_COMMAND}' (expected: deadlock-probe | run | cross | doctor)"
+            echo "::error::unsupported command; expected deadlock-probe, run, cross, or doctor"
             exit 2
             ;;
         esac
@@ -183,50 +217,119 @@ runs:
           deadlock-probe|cross|doctor) argv+=(--server "${INPUT_SERVER}") ;;
           run) ;; # server comes from the TOML config passed via `args`
         esac
-        if [ -n "${INPUT_ARGS:-}" ]; then
-          # `args` is documented as shell-quoted, so JSON like
-          # --args '{"ticker":"AAPL"}' survives word-splitting intact.
-          eval 'argv+=('"${INPUT_ARGS}"')'
+
+        # Decode a JSON string array into literal argv entries. The helper
+        # emits a tagged NUL-delimited stream and never asks a shell to parse
+        # caller-controlled text.
+        # shellcheck source=scripts/action-args.sh
+        source "${GITHUB_ACTION_PATH}/scripts/action-args.sh"
+        if ! mcp_loadtest_append_json_args "${INPUT_ARGS:-[]}"; then
+          echo "::error::args must be a JSON array containing only strings"
+          exit 2
         fi
 
-        echo "::group::${argv[*]}"
+        if [ -n "${INPUT_BASELINE:-}" ]; then
+          case "${INPUT_COMMAND}" in
+            run|deadlock-probe) ;;
+            *)
+              echo "::error::baseline comparison requires run or deadlock-probe"
+              exit 2
+              ;;
+          esac
+        fi
+
+        # The Action, not the caller or config, owns an empty per-invocation
+        # root. The appended override is the only location eligible for report
+        # attribution, eliminating stale/newest/set-difference races.
+        if ! mcp_loadtest_prepare_report_target \
+          "${INPUT_COMMAND}" \
+          "${RUNNER_TEMP:-${TMPDIR:-/tmp}}" \
+          "${argv[@]:2}"
+        then
+          echo "::error::could not prepare the Action-owned report directory"
+          exit 2
+        fi
+        case "${INPUT_COMMAND}" in
+          deadlock-probe|cross)
+            argv+=(--output-dir "${MCP_LOADTEST_REPORT_ROOT}")
+            ;;
+          run)
+            argv+=(--action-output-dir "${MCP_LOADTEST_REPORT_ROOT}")
+            ;;
+          doctor) ;;
+        esac
+        argv+=(--action-redact-server-identity)
+
+        # The wrapper never echoes caller-controlled argv into workflow-command
+        # syntax. CLI redaction is intentionally narrower (server identity and
+        # malformed JSON diagnostics), so inputs still are not a secret store.
+        echo "::group::mcp-loadtest ${INPUT_COMMAND}"
         status=0
         "${argv[@]}" || status=$?
         echo "::endgroup::"
 
-        # Newest run dir under ./runs (the tool's default --output-dir).
-        report_dir="./runs"
-        latest="$(ls -1td ./runs/*/ 2>/dev/null | head -n 1 || true)"
-        if [ -n "$latest" ]; then
-          report_dir="${latest%/}"
+        report_dir=""
+        discovery_status=0
+        if [ "${MCP_LOADTEST_REPORT_MODE}" != "none" ]; then
+          if ! mcp_loadtest_collect_run_dirs "${MCP_LOADTEST_REPORT_ROOT}"; then
+            echo "::error::could not enumerate reports in the Action-owned directory"
+            discovery_status=1
+          else
+            run_dir_count="${#MCP_LOADTEST_RUN_DIRS[@]}"
+            case "${MCP_LOADTEST_REPORT_MODE}" in
+              single)
+                if [ "$run_dir_count" -eq 1 ]; then
+                  report_dir="${MCP_LOADTEST_RUN_DIRS[0]}"
+                else
+                  echo "::error::command did not create exactly one report in the Action-owned directory"
+                  discovery_status=1
+                fi
+                ;;
+              multiple)
+                if [ "$run_dir_count" -ge 1 ]; then
+                  report_dir="${MCP_LOADTEST_REPORT_ROOT}"
+                else
+                  echo "::error::cross did not create a report in the Action-owned directory"
+                  discovery_status=1
+                fi
+                ;;
+            esac
+          fi
         fi
 
         compare_status=0
         compare_md=""
         if [ -n "${INPUT_BASELINE:-}" ]; then
           current="${report_dir}/metrics.json"
-          if [ -f "$current" ]; then
+          if [ "$status" -ne 0 ] || [ "$discovery_status" -ne 0 ]; then
+            echo "::error::baseline comparison skipped because the current invocation has no attributable report"
+            compare_status=1
+          elif [ -f "$current" ]; then
             compare_md="$(mcp-loadtest compare "${INPUT_BASELINE}" "$current" --format markdown)" || compare_status=$?
           else
-            echo "::error::baseline set but no metrics.json found at ${current}"
+            echo "::error::baseline set but this invocation did not produce metrics.json"
             compare_status=1
           fi
         fi
 
         passed=false
-        if [ "$status" -eq 0 ] && [ "$compare_status" -eq 0 ]; then
+        if [ "$status" -eq 0 ] && [ "$discovery_status" -eq 0 ] && [ "$compare_status" -eq 0 ]; then
           passed=true
         fi
 
         {
-          echo "## mcp-loadtest: \`${INPUT_COMMAND}\`"
+          echo "## mcp-loadtest"
           echo ""
           echo "| | |"
           echo "|---|---|"
-          echo "| Server | \`${INPUT_SERVER}\` |"
+          echo "| Command | \`${INPUT_COMMAND}\` |"
           echo "| Version | \`${MCP_LOADTEST_VERSION:-unknown}\` |"
-          echo "| Result | **${passed}** (exit ${status}) |"
-          echo "| Report dir | \`${report_dir}\` |"
+          echo "| Result | **${passed}** (command ${status}; report ${discovery_status}; compare ${compare_status}) |"
+          if [ -n "$report_dir" ]; then
+            echo "| Report dir | \`${report_dir}\` |"
+          else
+            echo "| Report dir | _(none)_ |"
+          fi
         } >> "$GITHUB_STEP_SUMMARY"
         if [ -n "$compare_md" ] || [ "$compare_status" -ne 0 ]; then
           {
@@ -252,9 +355,12 @@ runs:
           echo "passed=${passed}"
         } >> "$GITHUB_OUTPUT"
 
-        # Explicit failure semantics: a non-zero tool (or compare) exit fails
-        # this step, and therefore the caller's job.
+        # Explicit failure semantics: command, report attribution, and compare
+        # are independent gates. Any non-zero result fails the caller's job.
         if [ "$status" -ne 0 ]; then
           exit "$status"
+        fi
+        if [ "$discovery_status" -ne 0 ]; then
+          exit "$discovery_status"
         fi
         exit "$compare_status"

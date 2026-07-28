@@ -1,0 +1,33 @@
+scenario	status	reason
+tools_call	executed	Final-spec-reconciled subset: tool-call request, response, and error-envelope paths implemented by the adapter.
+request-metadata	executed	Final-spec-reconciled subset: 2026-07-28 tools/discover retry and per-request metadata implemented by the adapter.
+auth/metadata-default	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/metadata-var1	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/metadata-var2	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/metadata-var3	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/basic-cimd	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/scope-from-www-authenticate	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/scope-from-scopes-supported	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/scope-omitted-when-undefined	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/scope-step-up	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/scope-retry-limit	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/token-endpoint-auth-basic	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/token-endpoint-auth-post	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/token-endpoint-auth-none	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/pre-registration	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/resource-mismatch	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/offline-access-scope	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/offline-access-not-supported	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/authorization-server-migration	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/iss-supported	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/iss-not-advertised	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/iss-supported-missing	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/iss-wrong-issuer	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/iss-unexpected	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/iss-normalized	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+auth/metadata-issuer-mismatch	not-executed	Remote auth is static env-backed headers only; there is no OAuth discovery, login, refresh, DCR, DPoP, or token store.
+sep-2322-client-request-state	not-executed	The adapter does not implement the MRTR elicitation/request-state flow.
+http-standard-headers	executed	Final-spec-reconciled standard HTTP request-header behavior implemented by the adapter.
+http-custom-headers	executed	Final-spec-reconciled static custom request-header behavior implemented by the adapter.
+http-invalid-tool-headers	executed	Reserved, malformed, and unsafe request headers rejected in the final-spec-reconciled subset.
+json-schema-ref-no-deref	not-executed	The adapter does not implement the schema-reference dereferencing behavior exercised by this scenario.

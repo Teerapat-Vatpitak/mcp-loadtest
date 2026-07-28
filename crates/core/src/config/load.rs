@@ -37,6 +37,16 @@ pub fn split_server_command(s: &str) -> Result<(String, Vec<String>), ConfigErro
 }
 
 impl Config {
+    /// Validate a config regardless of how it was constructed.
+    ///
+    /// `from_toml_str` / `from_file` call this automatically. Programmatic
+    /// builders remain infallible for API compatibility, so execution
+    /// boundaries such as `Run::execute` must call this method before
+    /// creating artifacts, resolving credentials, or starting traffic.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        validate::validate(self)
+    }
+
     /// Parse a TOML string into a `Config` and run semantic validation.
     ///
     /// Returns [`ConfigError::Toml`] on syntactic failures and
@@ -44,7 +54,7 @@ impl Config {
     /// scenario kind, out-of-range thresholds).
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
         let cfg: Config = toml::from_str(s)?;
-        validate::validate(&cfg)?;
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -182,6 +192,38 @@ mod tests {
             matches!(err, ConfigError::Invalid(ref m) if m.contains("rss_leak_mb_per_sec")),
             "expected Invalid mentioning rss_leak_mb_per_sec, got: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_non_finite_process_thresholds() {
+        for (field, value) in [
+            ("memory_growth_mb", "nan"),
+            ("memory_growth_mb", "inf"),
+            ("memory_growth_mb", "-inf"),
+            ("rss_leak_mb_per_sec", "nan"),
+            ("rss_leak_mb_per_sec", "inf"),
+            ("rss_leak_mb_per_sec", "-inf"),
+        ] {
+            let toml_in = format!(
+                r#"
+                    [server]
+                    command = "python"
+                    [scenario]
+                    type = "soak"
+                    [thresholds]
+                    {field} = {value}
+                "#
+            );
+            let err = match Config::from_toml_str(&toml_in) {
+                Ok(_) => panic!("{field} accepted non-finite value {value}"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err, ConfigError::Invalid(ref message)
+                    if message.contains(field) && message.contains("finite")),
+                "{field}={value}: expected a finite-value validation error, got {err}"
+            );
+        }
     }
 
     #[test]

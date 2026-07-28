@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 /// (in the `mcp-loadtest` crate) evaluates each SLO against the per-tool
 /// latency snapshot from `Recorder::snapshot_per_tool`; when actual p99
 /// exceeds the budget a `ThresholdViolation` is appended to the report.
+/// Missing metrics or zero latency samples also produce a fail-closed
+/// violation; configuring an SLO requires exercising that tool.
 ///
 /// TOML shape:
 ///

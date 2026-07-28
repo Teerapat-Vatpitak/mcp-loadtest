@@ -25,14 +25,9 @@ use serde_json::Value;
 use tokio::task::yield_now;
 
 use super::Spike;
-use crate::scenario::{RunContext, ScenarioOutcome, pool};
+use crate::scenario::{RunContext, ScenarioOutcome, pool, teardown};
 use mcp_loadtest_core::metrics::CallOutcome;
 use mcp_loadtest_protocol::Session;
-
-/// Per-worker graceful-shutdown budget. Bounded so one wedged server can't
-/// stall the phase join; on timeout the dropped `Session` is reaped via
-/// `kill_on_drop` (same policy as `sustained`'s pooled path).
-const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Drive all three phases, each through its own session pool. Takes the
 /// outcome already carrying the validation notes; appends phase notes and
@@ -59,6 +54,17 @@ pub(super) async fn drive_pooled_phases(
     ];
 
     for (phase_name, workers, phase_duration) in phases {
+        // Zero-length warmup/cooldown are an intentional way to request a
+        // spike-only workload. Do not spawn a pool for a phase with no call
+        // window: every worker would necessarily return zero calls and the
+        // pool's general completeness guard would (correctly for a real
+        // phase, incorrectly for an omitted one) mark them incomplete.
+        if phase_duration.is_zero() {
+            outcome
+                .notes
+                .push(format!("spike.{phase_name}: skipped because duration is 0"));
+            continue;
+        }
         if ctx.is_cancelled() {
             outcome.notes.push(format!(
                 "spike.{phase_name}: cancelled via ctx.cancel_token"
@@ -108,9 +114,9 @@ async fn drive_phase_pooled(
             let tool = Arc::clone(&tool);
             let args = Arc::clone(&args);
             async move {
-                let outcome =
+                let mut outcome =
                     worker_call_loop(phase_deadline, &tool, &args, &mut session, &worker_ctx).await;
-                shutdown_worker(session).await;
+                teardown::shutdown_session(session, &mut outcome, "spike pooled worker").await;
                 outcome
             }
         })
@@ -180,9 +186,15 @@ async fn worker_call_loop(
         outcome.total_calls += 1;
 
         match result {
-            Ok(_) => {
-                outcome.successful_calls += 1;
-                ctx.metrics.record_tool(tool, elapsed, CallOutcome::Success);
+            Ok(result) => {
+                let kind = if crate::scenario::is_logical_tool_error(&result) {
+                    outcome.error_count += 1;
+                    CallOutcome::ServerError
+                } else {
+                    outcome.successful_calls += 1;
+                    CallOutcome::Success
+                };
+                ctx.metrics.record_tool(tool, elapsed, kind);
             }
             Err(err) => {
                 outcome.error_count += 1;
@@ -202,23 +214,6 @@ async fn worker_call_loop(
     outcome
 }
 
-/// Polite bounded teardown of one worker session; on timeout/error the child
-/// is still reaped via `kill_on_drop` when `session` drops.
-async fn shutdown_worker(session: Session) {
-    match tokio::time::timeout(WORKER_SHUTDOWN_TIMEOUT, session.shutdown()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "spike: pooled worker shutdown errored");
-        }
-        Err(_) => {
-            tracing::warn!(
-                "spike: pooled worker shutdown exceeded {WORKER_SHUTDOWN_TIMEOUT:?}; \
-                 child reaped via kill_on_drop"
-            );
-        }
-    }
-}
-
 /// Fold one phase's merged pool outcome into the scenario total, keeping the
 /// pool notes attributable to their phase.
 fn merge_phase(into: &mut ScenarioOutcome, phase_name: &str, from: ScenarioOutcome) {
@@ -227,6 +222,9 @@ fn merge_phase(into: &mut ScenarioOutcome, phase_name: &str, from: ScenarioOutco
     into.hang_count += from.hang_count;
     into.deadlock_count += from.deadlock_count;
     into.error_count += from.error_count;
+    into.divergence_count += from.divergence_count;
+    into.incomplete_worker_count += from.incomplete_worker_count;
+    into.teardown_failure_count += from.teardown_failure_count;
     into.hung_for_ms.extend(from.hung_for_ms);
     into.notes.extend(
         from.notes
@@ -252,6 +250,9 @@ mod tests {
             hang_count: 0,
             deadlock_count: 0,
             error_count: 1,
+            divergence_count: 1,
+            incomplete_worker_count: 1,
+            teardown_failure_count: 1,
             notes: vec!["pool: 2 workers (2 requested)".to_owned()],
             hung_for_ms: vec![],
         };
@@ -259,6 +260,9 @@ mod tests {
         assert_eq!(total.total_calls, 5);
         assert_eq!(total.successful_calls, 4);
         assert_eq!(total.error_count, 1);
+        assert_eq!(total.divergence_count, 1);
+        assert_eq!(total.incomplete_worker_count, 1);
+        assert_eq!(total.teardown_failure_count, 1);
         assert_eq!(
             total.notes,
             vec!["spike.spike: pool: 2 workers (2 requested)"]

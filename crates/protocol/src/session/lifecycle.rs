@@ -11,9 +11,32 @@ use std::time::Duration;
 
 use super::{DEFAULT_STARTUP_TIMEOUT, Session, SessionError};
 use crate::mcp::{ClientInfo, InitializeParams, InitializeResult, ProtocolVersion};
-use crate::transport::Transport;
 use crate::transport::spawn_options::SpawnOptions;
 use crate::transport::stdio::StdioTransport;
+use crate::transport::{Transport, TransportError};
+
+/// Startup failures still own a live transport. Give teardown enough room to
+/// complete stdio's composed shutdown budget instead of relying on
+/// `kill_on_drop`, which requests termination but cannot prove reap/log drain.
+pub(super) const FAILED_STARTUP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Preserve the original startup error when cleanup succeeds. If cleanup is
+/// uncertain, surface both facts as one fail-closed transport error.
+pub(super) async fn cleanup_failed_startup(
+    session: Session,
+    startup_error: SessionError,
+) -> SessionError {
+    match tokio::time::timeout(FAILED_STARTUP_SHUTDOWN_TIMEOUT, session.shutdown()).await {
+        Ok(Ok(())) => startup_error,
+        Ok(Err(cleanup_error)) => SessionError::Transport(TransportError::Other(format!(
+            "session startup failed ({startup_error}); startup teardown failed ({cleanup_error})"
+        ))),
+        Err(_) => SessionError::Transport(TransportError::Other(format!(
+            "session startup failed ({startup_error}); startup teardown exceeded \
+             {FAILED_STARTUP_SHUTDOWN_TIMEOUT:?}"
+        ))),
+    }
+}
 
 impl Session {
     /// Construct a session from any [`Transport`]. Performs the `initialize`
@@ -131,5 +154,90 @@ impl Session {
     pub async fn shutdown(self) -> Result<(), SessionError> {
         self.transport.shutdown().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use async_trait::async_trait;
+
+    use super::*;
+
+    struct FailingStartupTransport {
+        shutdown_called: Arc<AtomicBool>,
+        pending_request: bool,
+    }
+
+    #[async_trait]
+    impl Transport for FailingStartupTransport {
+        async fn request(&mut self, _body: &str) -> Result<String, TransportError> {
+            if self.pending_request {
+                std::future::pending().await
+            } else {
+                Err(TransportError::Closed)
+            }
+        }
+
+        async fn notify(&mut self, _body: &str) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn shutdown(self: Box<Self>) -> Result<(), TransportError> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_error_explicitly_shuts_down_transport() {
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let result = Session::from_transport_with(
+            FailingStartupTransport {
+                shutdown_called: Arc::clone(&shutdown_called),
+                pending_request: false,
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("initialize transport failure must surface"),
+        };
+
+        assert!(matches!(
+            error,
+            SessionError::Transport(TransportError::Closed)
+        ));
+        assert!(
+            shutdown_called.load(Ordering::SeqCst),
+            "failed constructor must explicitly shut down its live transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_timeout_explicitly_shuts_down_transport() {
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let budget = Duration::from_millis(10);
+        let result = Session::from_transport_with(
+            FailingStartupTransport {
+                shutdown_called: Arc::clone(&shutdown_called),
+                pending_request: true,
+            },
+            budget,
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("initialize timeout must surface"),
+        };
+
+        assert!(matches!(error, SessionError::StartupTimeout(value) if value == budget));
+        assert!(
+            shutdown_called.load(Ordering::SeqCst),
+            "timed-out constructor must explicitly shut down its live transport"
+        );
     }
 }

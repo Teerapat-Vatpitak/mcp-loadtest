@@ -16,7 +16,86 @@ use super::{Session, SessionError, connection, strict};
 use crate::jsonrpc::{
     JSONRPC_VERSION, OutgoingNotification, OutgoingRequest, ResponseEnvelope, ResponsePayload,
 };
-use crate::mcp::{CallToolParams, CallToolResult, ListToolsResult, Tool};
+use crate::mcp::{CallToolParams, CallToolResult, ListToolsResult, ProtocolVersion, Tool};
+
+fn response_shape_error(method: &str, detail: &str) -> SessionError {
+    SessionError::ResponseShape(<serde_json::Error as serde::de::Error>::custom(format!(
+        "stateless 2026-07-28 `{method}` result {detail}"
+    )))
+}
+
+/// Validate the final stateless result envelope before method-specific serde
+/// discards fields it does not currently expose. This is deliberately kept
+/// out of the legacy handshake path: older revisions predate these fields.
+fn validate_final_stateless_result(method: &str, result: &Value) -> Result<(), SessionError> {
+    let object = result
+        .as_object()
+        .ok_or_else(|| response_shape_error(method, "must be an object"))?;
+
+    match object.get("resultType") {
+        Some(Value::String(result_type)) if result_type == "complete" => {}
+        Some(Value::String(result_type)) => {
+            return Err(response_shape_error(
+                method,
+                &format!("has unsupported `resultType` value `{result_type}`"),
+            ));
+        }
+        Some(_) => {
+            return Err(response_shape_error(
+                method,
+                "field `resultType` must be the string `complete`",
+            ));
+        }
+        None => {
+            return Err(response_shape_error(
+                method,
+                "is missing required field `resultType`",
+            ));
+        }
+    }
+
+    if matches!(method, "server/discover" | "tools/list") {
+        match object.get("ttlMs") {
+            Some(value) if value.as_u64().is_some() => {}
+            Some(_) => {
+                return Err(response_shape_error(
+                    method,
+                    "field `ttlMs` must be a non-negative integer",
+                ));
+            }
+            None => {
+                return Err(response_shape_error(
+                    method,
+                    "is missing required field `ttlMs`",
+                ));
+            }
+        }
+
+        match object.get("cacheScope") {
+            Some(Value::String(scope)) if matches!(scope.as_str(), "private" | "public") => {}
+            Some(Value::String(scope)) => {
+                return Err(response_shape_error(
+                    method,
+                    &format!("has unsupported `cacheScope` value `{scope}`"),
+                ));
+            }
+            Some(_) => {
+                return Err(response_shape_error(
+                    method,
+                    "field `cacheScope` must be the string `private` or `public`",
+                ));
+            }
+            None => {
+                return Err(response_shape_error(
+                    method,
+                    "is missing required field `cacheScope`",
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
 
 impl Session {
     /// Call `tools/list` and return the server's tool registry.
@@ -125,14 +204,34 @@ impl Session {
         let response_body = self.transport.request(&body).await?;
 
         let env: ResponseEnvelope = serde_json::from_str(&response_body)?;
-        if env.id != id {
-            return Err(SessionError::IdMismatch {
-                expected: id,
-                got: env.id,
-            });
+        if env.jsonrpc != JSONRPC_VERSION {
+            return Err(SessionError::InvalidJsonRpcVersion { got: env.jsonrpc });
+        }
+        if env.id.as_u64() != Some(id) {
+            return match env.payload {
+                ResponsePayload::Ok { result } => Err(SessionError::MismatchedSuccessResponse {
+                    expected: id,
+                    got: env.id,
+                    result,
+                }),
+                ResponsePayload::Err { error } => Err(SessionError::MismatchedErrorResponse {
+                    expected: id,
+                    got: env.id,
+                    error,
+                }),
+            };
         }
         match env.payload {
-            ResponsePayload::Ok { result } => Ok(serde_json::from_value(result)?),
+            ResponsePayload::Ok { result } => {
+                if self
+                    .stateless
+                    .as_ref()
+                    .is_some_and(|meta| meta.version == ProtocolVersion::V2026_07_28)
+                {
+                    validate_final_stateless_result(method, &result)?;
+                }
+                serde_json::from_value(result).map_err(SessionError::ResponseShape)
+            }
             ResponsePayload::Err { error } => Err(SessionError::Server(error)),
         }
     }

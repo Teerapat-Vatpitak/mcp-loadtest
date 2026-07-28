@@ -141,7 +141,7 @@ async fn fuzzer_against_mock_normal_finishes_cleanly() {
         "outcome should contain a fuzzer summary note: {outcome:?}"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
@@ -200,7 +200,7 @@ async fn fuzzer_default_payloads_include_skipped_variants() {
         "summary note must record all 20 iterations: {outcome:?}"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");

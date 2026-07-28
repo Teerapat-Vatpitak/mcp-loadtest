@@ -11,6 +11,7 @@
 use std::ffi::OsStr;
 use std::time::Duration;
 
+use super::lifecycle::cleanup_failed_startup;
 use super::{Session, SessionError};
 use crate::mcp::ProtocolVersion;
 use crate::transport::Transport;
@@ -40,11 +41,15 @@ impl Session {
             tool_schemas: None,
             tool_output_schemas: None,
         };
-        match tokio::time::timeout(startup_timeout, session.initialize()).await {
-            Ok(result) => result?,
-            Err(_) => return Err(SessionError::StartupTimeout(startup_timeout)),
+        let startup_result = match tokio::time::timeout(startup_timeout, session.initialize()).await
+        {
+            Ok(result) => result,
+            Err(_) => Err(SessionError::StartupTimeout(startup_timeout)),
+        };
+        match startup_result {
+            Ok(()) => Ok(session),
+            Err(error) => Err(cleanup_failed_startup(session, error).await),
         }
-        Ok(session)
     }
 
     /// Like [`Session::spawn_with_timeout`], but advertising an explicit

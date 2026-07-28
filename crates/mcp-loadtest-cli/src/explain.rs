@@ -60,26 +60,26 @@ fn explanation_for(subcommand: Option<&str>) -> &'static str {
 /// contract and the runtime output never drift (snapshot-stable per §21.9).
 const DEADLOCK_PROBE: &str = "\
 Algorithm:
-  1. Spawn server process.
-  2. Send `initialize`. Wait up to startup_timeout (default 10s).
-  3. Send `notifications/initialized`.
-  4. Send `tools/list`. Wait up to 1s.
-  5. Issue N sequential `tools/call` probes against the same session.
-     (The barrier-released concurrent burst of DESIGN §15.2 needs the
-     multi-session pool — M8+ backlog. The lazy-init bug class hangs
-     regardless of concurrency, so the probe still catches it.)
+  1. Spawn/connect, initialize (or discover), and complete the required
+     initial `tools/list` within one startup_timeout budget (default 10s).
+  2. Send `notifications/initialized` as part of handshake-mode startup.
+  3. Retain the discovered tool registry for startup and strict validation.
+  4. Start the configured deadlock probe.
+  5. Spawn N independent sessions, wait until every live worker is ready,
+     then release their identical `tools/call` requests through one
+     synchronization gate.
   6. Each call wrapped in hang_detect(hang_threshold, grace_period):
      - response within hang_threshold → SUCCESS
      - response between threshold and grace_period → SLOW (warning)
      - no response after grace_period → DEADLOCK (critical)
-  7. Bail on the first DEADLOCK — the session is wedged — and report.
+  7. Join every worker, aggregate all DEADLOCK/SLOW/error outcomes, and report.
 
 Defaults: this subcommand probes quickly (N=5, hang_threshold=2s,
   grace_period=5s); `run` with `[scenario] type = \"deadlock_probe\"` is the
   thorough CI form (N=20, hang_threshold=5s, grace_period=10s).
 
 Tunable knobs: --concurrent, --hang-threshold, --grace-period.
-See DESIGN.md §15.2 for the spec source (and its \"Shipped reality\" note).
+See DESIGN.md §15.2 for the spec source.
 ";
 
 const RUN: &str = "\
@@ -100,8 +100,9 @@ Algorithm:
   6. Compare against `[thresholds]`; non-zero exit on any violation.
 
 Tunable knobs: --config (everything else lives in the TOML),
-  --capture-stderr (capture the server's stderr to
-  runs/<id>/server-stderr.log), --tee-stderr (capture AND mirror it live),
+  --capture-stderr (capture the initial session to
+  runs/<id>/server-stderr.log and factory sessions under server-stderr/),
+  --tee-stderr (capture AND mirror every session live),
   --trace (record every JSON-RPC frame to an mcp-trace/1 JSONL file,
   replayable via `replay`; see ADR 0021).
 See DESIGN.md §15 for the per-scenario specs.
@@ -239,11 +240,11 @@ mod tests {
         let t = explanation_for(Some("deadlock-probe"));
         // Landmarks copied verbatim from DESIGN §21.4 — drift here means the
         // documented contract and the runtime output diverged.
-        assert!(t.contains("sequential `tools/call` probes"));
+        assert!(t.contains("synchronization gate"));
         assert!(t.contains("hang_threshold"));
         assert!(t.contains("grace_period"));
         assert!(t.contains("DEADLOCK (critical)"));
-        assert!(t.contains("Bail on the first DEADLOCK"));
+        assert!(t.contains("Join every worker"));
         assert!(t.contains("See DESIGN.md §15.2 for the spec source"));
     }
 

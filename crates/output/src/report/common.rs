@@ -74,10 +74,76 @@ pub(crate) fn format_server_command(report: &Report) -> String {
 /// consistent.
 pub(crate) fn describe_failure(report: &Report) -> String {
     let dc = report.scenario_outcome.deadlock_count;
+    let divergences = report.scenario_outcome.divergence_count;
     let tv = report.threshold_violations.len();
     let mut parts: Vec<String> = Vec::new();
     if dc > 0 {
         parts.push(format!("{dc} deadlock{}", if dc == 1 { "" } else { "s" }));
+    }
+    if divergences > 0 {
+        parts.push(format!(
+            "{divergences} response divergence{}",
+            if divergences == 1 { "" } else { "s" }
+        ));
+    }
+    if report.scenario_name == "race_check" && report.scenario_outcome.error_count > 0 {
+        parts.push("incomplete race-check cohort".to_owned());
+    }
+    if report.scenario_name == "deadlock_probe" && report.scenario_outcome.error_count > 0 {
+        let errors = report.scenario_outcome.error_count;
+        parts.push(format!(
+            "{errors} probe error{}",
+            if errors == 1 { "" } else { "s" }
+        ));
+    }
+    if report.scenario_name == "fuzzer" && report.scenario_outcome.error_count > 0 {
+        let errors = report.scenario_outcome.error_count;
+        parts.push(format!(
+            "{errors} unexpected fuzzer error{}",
+            if errors == 1 { "" } else { "s" }
+        ));
+    }
+    let incomplete_workers = report.scenario_outcome.incomplete_worker_count;
+    if incomplete_workers > 0 && report.scenario_name != "race_check" {
+        parts.push(format!(
+            "{incomplete_workers} incomplete pooled worker{}",
+            if incomplete_workers == 1 { "" } else { "s" }
+        ));
+    }
+    let teardown_failures = report.scenario_outcome.teardown_failure_count;
+    if teardown_failures > 0 {
+        parts.push(format!(
+            "{teardown_failures} teardown failure{}",
+            if teardown_failures == 1 { "" } else { "s" }
+        ));
+    }
+    if report.scenario_outcome.total_calls == 0 {
+        parts.push("no calls attempted".to_owned());
+    } else if report.scenario_outcome.successful_calls == 0 && dc == 0 {
+        parts.push("no successful calls".to_owned());
+    }
+    let recorded = &report.metrics.outcomes;
+    if dc == 0 && recorded.deadlock > 0 {
+        parts.push(format!(
+            "{} recorded deadlock{}",
+            recorded.deadlock,
+            if recorded.deadlock == 1 { "" } else { "s" }
+        ));
+    }
+    let protocol_count = recorded.protocol_error + recorded.malformed;
+    if protocol_count > 0 {
+        parts.push(format!(
+            "{protocol_count} protocol/malformed outcome{}",
+            if protocol_count == 1 { "" } else { "s" }
+        ));
+    }
+    let terminal_count =
+        recorded.timeout + recorded.crash + recorded.disconnected + recorded.cancelled;
+    if terminal_count > 0 {
+        parts.push(format!(
+            "{terminal_count} terminal session outcome{}",
+            if terminal_count == 1 { "" } else { "s" }
+        ));
     }
     if tv > 0 {
         parts.push(format!(
@@ -86,9 +152,8 @@ pub(crate) fn describe_failure(report: &Report) -> String {
         ));
     }
     if parts.is_empty() {
-        // Defensive — Report::passed() returned false but neither known
-        // signal is set. Shouldn't happen today; future contract changes
-        // might. Render something rather than misleading the user.
+        // Defensive fallback for a future unconditional Report::passed signal
+        // that this formatter has not learned yet.
         return "unspecified failure".to_string();
     }
     parts.join(", ")

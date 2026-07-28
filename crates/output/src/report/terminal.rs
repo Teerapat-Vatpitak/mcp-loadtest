@@ -102,8 +102,12 @@ fn write_header(out: &mut String, report: &Report) -> std::fmt::Result {
 fn write_throughput(out: &mut String, report: &Report) -> std::fmt::Result {
     let tp = &report.metrics.throughput;
     let total = tp.total_requests;
-    let ok = tp.successful_requests;
-    let errors = total.saturating_sub(ok);
+    let expected_rejections = report.metrics.outcomes.expected_rejection;
+    // Throughput treats an expected fuzz rejection as a healthy probe. Keep
+    // the human "ok" label for ordinary successes and show the expected
+    // subset separately so it cannot be mistaken for a normal tool result.
+    let ok = tp.successful_requests.saturating_sub(expected_rejections);
+    let errors = total.saturating_sub(ok.saturating_add(expected_rejections));
     let error_rate_pct = if total == 0 {
         0.0
     } else {
@@ -129,6 +133,23 @@ fn write_throughput(out: &mut String, report: &Report) -> std::fmt::Result {
         out,
         "  requests:  {total_s} total · {ok_s} ok · {errors_s} errors {pct_s}",
     )?;
+
+    if expected_rejections > 0 {
+        writeln!(
+            out,
+            "  expected rejections: {}",
+            style(fmt_count(expected_rejections)).cyan()
+        )?;
+    }
+    if report.scenario_outcome.teardown_failure_count > 0 {
+        writeln!(
+            out,
+            "  teardown failures: {}",
+            style(fmt_count(report.scenario_outcome.teardown_failure_count))
+                .red()
+                .bold()
+        )?;
+    }
 
     let rps = format!("{:.1}", tp.requests_per_sec);
     writeln!(out, "  rps:       {}", style(rps).cyan())?;
@@ -325,13 +346,25 @@ mod tests {
     // `fmt_duration` / `fmt_count` are tested in `report::common::tests`.
 
     #[test]
-    fn renders_pass_when_no_violations() {
+    fn renders_pass_for_clean_scenario_outcome() {
         // Force colors off so the test is portable across platforms / CI tty
         // configs. We're asserting on plain text, not on ANSI sequences.
         set_colors_enabled(false);
 
         let mut report = sample_report();
         report.threshold_violations.clear();
+        report.scenario_outcome = ScenarioOutcome {
+            total_calls: 12_345,
+            successful_calls: 12_300,
+            error_count: 45,
+            ..Default::default()
+        };
+        // Keep only application-level errors so the PASS assertion exercises
+        // their threshold-governed policy; protocol/malformed outcomes are
+        // unconditional correctness failures.
+        report.metrics.outcomes.timeout = 0;
+        report.metrics.outcomes.protocol_error = 0;
+        report.metrics.outcomes.malformed = 0;
         let s = TerminalReporter.render(&report).unwrap();
 
         assert!(s.contains("PASS"), "expected PASS badge, got: {s}");
@@ -354,6 +387,30 @@ mod tests {
         assert!(s.contains("123.4ms"));
         assert!(s.contains("❌"));
         assert!(s.contains("<= 100ms"));
+    }
+
+    #[test]
+    fn renders_incomplete_race_cohort_as_failure() {
+        set_colors_enabled(false);
+
+        let mut report = sample_report();
+        report.scenario_name = "race_check".into();
+        report.threshold_violations.clear();
+        report.scenario_outcome = ScenarioOutcome {
+            total_calls: 2,
+            successful_calls: 2,
+            error_count: 1,
+            ..Default::default()
+        };
+        report.metrics.outcomes = OutcomeCounts {
+            success: 2,
+            server_error: 1,
+            ..Default::default()
+        };
+
+        let s = TerminalReporter.render(&report).unwrap();
+        assert!(s.contains("FAIL"), "got: {s}");
+        assert!(s.contains("incomplete race-check cohort"), "got: {s}");
     }
 
     #[test]

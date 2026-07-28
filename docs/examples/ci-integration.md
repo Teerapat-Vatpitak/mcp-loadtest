@@ -1,15 +1,21 @@
 # CI integration
 
 Use `mcp-loadtest` as a regression gate on every pull request. The exit code is
-non-zero whenever a threshold is violated or `deadlock_probe` detects a
-deadlock, so it slots into GitHub Actions / GitLab CI / Buildkite without any
-wrapper script.
+non-zero for threshold violations and unconditional correctness failures such
+as no successful calls, deadlocks, response divergences, and terminal
+transport failures.
+
+> **Availability note:** use the examples pinned to `v0.1.0` only when the
+> exact tag and its published GitHub Release exist and GitHub immutable
+> releases is enabled. Source text and a manifest version do not prove
+> availability. Otherwise, test by building an authorized checkout under
+> [`docs/RELEASE.md`](../RELEASE.md).
 
 ## Quickest path: the composite action
 
-This repo ships a composite GitHub Action ([`action.yml`](../../action.yml) at
-the repo root), so a one-line `uses:` gets you a deadlock probe on every PR —
-no install scripts, no asset-name bookkeeping:
+This repo contains a composite GitHub Action ([`action.yml`](../../action.yml)
+at the repo root). With a verified `v0.1.0` Release, an exact `uses:` pin gets
+you a deadlock probe on every PR:
 
 ```yaml
 # .github/workflows/loadtest.yml
@@ -33,16 +39,14 @@ jobs:
 
             - name: Deadlock probe
               id: loadtest
-              # Pin a released tag. A floating `v1` tag tracking the latest
-              # v0.x release is planned (ADR 0020); once it exists, `@v1`
-              # becomes the recommended pin.
-              uses: Teerapat-Vatpitak/mcp-loadtest@v0.0.1
+              # Post-release only: pin the immutable exact version.
+              uses: Teerapat-Vatpitak/mcp-loadtest@v0.1.0
               with:
+                  version: v0.1.0
                   server: "python -m my_mcp"
-                  args: >-
-                      --tool get_market_data
-                      --concurrent 10
-                      --args '{"ticker":"AAPL"}'
+                  # JSON array: each element becomes exactly one argv entry.
+                  # Shell syntax is never evaluated.
+                  args: '["--tool","get_market_data","--concurrent","10","--args","{\"ticker\":\"AAPL\"}"]'
 
             - name: Upload run artifacts
               if: always()
@@ -52,7 +56,7 @@ jobs:
                   path: runs/
 ```
 
-The action downloads the prebuilt release binary for the runner
+After release, the action downloads the prebuilt release binary for the runner
 (linux x64, macOS x64/arm64, windows x64 — windows runners work because the
 steps use `shell: bash` via git-bash), verifies the `.sha256` sidecar, and
 falls back to `cargo install --git` on any other platform (needs a Rust
@@ -66,20 +70,27 @@ that is the regression gate. The action uploads nothing itself; keep the
 | ------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------- |
 | `server`            | — (required)     | Server command string passed to `--server`, e.g. `"python -m my_mcp"`. Ignored by `command: run` (TOML has it). |
 | `command`           | `deadlock-probe` | One of `deadlock-probe`, `run`, `cross`, `doctor`. For `run`, pass `--config ci.toml` via `args`.               |
-| `args`              | `""`             | Extra CLI args appended verbatim (shell-quoting respected, so JSON survives).                                   |
-| `version`           | `latest`         | Release tag of the binary to install, e.g. `v0.0.1`.                                                            |
-| `baseline`          | `""`             | Path to a baseline `metrics.json`. When set, also runs `compare` against the new run and fails on regression.   |
+| `args`              | `[]`             | Extra CLI arguments as a JSON array of strings. Each element is one literal argument; shell syntax is rejected. |
+| `version`           | `v0.1.0`         | Stable release tag of the binary to install. Set `latest` explicitly only when reproducibility is not required. |
+| `baseline`          | `""`             | Baseline `metrics.json` for a single-report `run` or `deadlock-probe`; rejected for `cross` and `doctor`.       |
 | `working-directory` | `.`              | Directory to run in.                                                                                            |
+
+The Action reference and installed binary are both pinned in the example.
+`version: latest` asks GitHub for the newest Release at run time and is less
+reproducible; it also cannot resolve before the first Release exists.
 
 ### Outputs
 
-| Output       | Description                                                                          |
-| ------------ | ------------------------------------------------------------------------------------ |
-| `report-dir` | Newest run directory (`./runs/<run-id>` — contains `report.md` and `metrics.json`).  |
-| `passed`     | `"true"`/`"false"` from the exit code (readable even on failure via `if: always()`). |
+| Output       | Description                                                                                                         |
+| ------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `report-dir` | Exact new run directory for `run`/`deadlock-probe`, the current `cross` report root, or empty for `doctor`.        |
+| `passed`     | `"true"` only when command, report attribution, and optional comparison all pass; otherwise `"false"`.           |
 
 A short results table is appended to the job summary (`$GITHUB_STEP_SUMMARY`)
 on every run, including the `compare` diff when `baseline` is set.
+Report attribution uses the set of run directories created by that invocation,
+not modification time, so an older or concurrently written report cannot be
+selected as the comparison input.
 
 The rest of this page is the manual recipe — same behavior, more knobs — for
 when you need fine-grained control over install, caching, or thresholds.
@@ -160,9 +171,9 @@ jobs:
             - name: Install MCP server under test
               run: pip install -e .
 
-            # Not on crates.io (ADR 0015) — install from the git tag.
+            # Post-release example: install from the immutable git tag.
             - name: Install mcp-loadtest
-              run: cargo install --git https://github.com/Teerapat-Vatpitak/mcp-loadtest --tag v0.0.1 --locked mcp-loadtest-cli
+              run: cargo install --git https://github.com/Teerapat-Vatpitak/mcp-loadtest --tag v0.1.0 --locked mcp-loadtest-cli
 
             # Headline check — fails the build on any deadlock.
             - name: Deadlock probe
@@ -252,6 +263,41 @@ budgets:
 `compare` exits non-zero when any metric regresses past the policy in the
 baseline. The markdown rendering drops cleanly into the GitHub Actions job
 summary.
+
+## Remote authentication scope
+
+For `http`, `sse`, or `ws`, keep credentials in the CI secret store and map a
+header name to the environment-variable name in TOML:
+
+```toml
+[server]
+transport = "http"
+url = "https://mcp.example.com/mcp"
+allowed_hosts = ["mcp.example.com"]
+headers_from_env = { Authorization = "MCP_AUTHORIZATION" }
+```
+
+```yaml
+- name: Authenticated remote load test
+  env:
+    MCP_AUTHORIZATION: Bearer ${{ secrets.MCP_TOKEN }}
+  run: mcp-loadtest run --config remote-ci.toml
+```
+
+The environment variable must contain the complete header value.
+`headers_from_env` is the only explicit remote-credential facility. If it is
+nonempty, HTTP/SSE require `https://` and WebSocket requires `wss://`; the
+client never falls back to plaintext. URL userinfo is forbidden. Query
+strings are transmitted unchanged to the target but replaced wholesale with
+`?redacted` in reports and traces, so never put credentials in a query.
+Literal headers in TOML, OAuth login/refresh/discovery, and interactive
+authorization are not supported, and protocol-owned/connection headers
+cannot be overridden. Never place a secret in the Action's `server` or `args`
+value: arguments are not shell-evaluated, and the Action redacts server
+identity plus malformed-JSON argument diagnostics, but arbitrary server
+response content is not sanitized. Workflow inputs are not a secret store and
+the operating system can inspect child process argv. Use environment-backed
+credentials.
 
 ## Tips
 

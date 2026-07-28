@@ -4,7 +4,7 @@
 //!
 //! [1]: https://modelcontextprotocol.io/specification/
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 
 /// Wire string reported as our own `protocolVersion` by the self-hosted
@@ -69,27 +69,31 @@ pub(crate) struct ServerInfo {
 
 /// Result of `server/discover` (2026-07-28 stateless core, ADR 0019).
 ///
-/// Parsed tolerantly against the **release candidate** shape: every field is
-/// optional/defaulted so a server reporting more or fewer fields still
-/// parses. Field names re-verified against the final spec on 2026-07-29.
+/// Wire shape reconciled against the official final specification at
+/// `5f5440bb26a62e2cf3440b92da5a667efa03b267`. Its only schema delta from
+/// the previously pinned snapshot affects the currently unsupported
+/// `subscriptions/listen` method, so this implemented subset is unchanged.
 #[expect(
     dead_code,
     reason = "serde-populated; only the version fields are read today, the rest round-trip losslessly for forward-compat and dead_code can't see serde"
 )]
 #[derive(Debug, Deserialize)]
 pub(crate) struct DiscoverResult {
-    /// Preferred revision the server speaks, if reported.
-    #[serde(rename = "protocolVersion", default)]
-    pub protocol_version: Option<String>,
-    /// Full list of revisions the server supports, if reported.
-    #[serde(rename = "protocolVersions", default)]
-    pub protocol_versions: Vec<String>,
+    /// Full list of revisions the server supports.
+    #[serde(rename = "supportedVersions")]
+    pub supported_versions: Vec<String>,
     /// Server capabilities.
     #[serde(default)]
     pub capabilities: Value,
-    /// Optional server identity.
-    #[serde(rename = "serverInfo", default)]
-    pub server_info: Option<ServerInfo>,
+    /// Ordinary results carry `resultType = "complete"`. Missing remains
+    /// accepted because the spec requires clients to treat older results
+    /// without this field as complete.
+    #[serde(rename = "resultType", default)]
+    pub result_type: Option<String>,
+    /// Result metadata, including optional
+    /// `io.modelcontextprotocol/serverInfo`.
+    #[serde(rename = "_meta", default)]
+    pub meta: Value,
 }
 
 /// Result of `tools/list`.
@@ -133,6 +137,10 @@ pub(crate) struct CallToolParams<'a> {
 /// Result returned by `tools/call`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CallToolResult {
+    /// Protocol result metadata. MCP reserves `_meta` for implementation and
+    /// transport hints that clients should preserve.
+    #[serde(rename = "_meta", default)]
+    pub meta: Option<Value>,
     /// Tool output content (text/image/resource).
     pub content: Vec<Content>,
     /// True if the tool reported a logical error (vs. JSON-RPC error).
@@ -145,27 +153,93 @@ pub struct CallToolResult {
 }
 
 /// A piece of content returned by a tool call.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
+///
+/// The explicit `Text` / `Image` variants retain the original ergonomic API
+/// for their minimal wire shapes. Content with optional metadata, newer MCP
+/// variants, or vendor extensions is kept field-for-field as parsed JSON in
+/// [`Content::Raw`]. This matters to callers such as the race detector:
+/// collapsing two distinct forward-compatible responses into one catch-all
+/// value would produce a false "no divergence" result.
+#[derive(Debug, Clone)]
 pub enum Content {
     /// Plain text content.
-    #[serde(rename = "text")]
     Text {
         /// The text payload.
         text: String,
     },
     /// Image content as base64.
-    #[serde(rename = "image")]
     Image {
         /// Base64-encoded image bytes.
         data: String,
         /// MIME type (e.g. `image/png`).
-        #[serde(rename = "mimeType")]
         mime_type: String,
     },
-    /// Other content types we don't model yet — preserved as raw JSON for forward-compat.
-    #[serde(other)]
+    /// A valid content object whose complete wire shape must be preserved.
+    ///
+    /// This includes audio, resource links, embedded resources, unknown future
+    /// variants, and otherwise-known text/image blocks carrying annotations,
+    /// `_meta`, or extension fields.
+    Raw(Value),
+    /// Legacy programmatic catch-all retained for source compatibility.
+    ///
+    /// Wire deserialization uses [`Content::Raw`] instead so information is
+    /// never discarded.
     Other,
+}
+
+impl<'de> Deserialize<'de> for Content {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| de::Error::custom("MCP content block must be an object"))?;
+        let content_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| de::Error::custom("MCP content block requires string field `type`"))?;
+
+        match content_type {
+            "text" => {
+                let text = object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        de::Error::custom("MCP text content requires string field `text`")
+                    })?
+                    .to_owned();
+                if object.len() == 2 {
+                    Ok(Self::Text { text })
+                } else {
+                    Ok(Self::Raw(value))
+                }
+            }
+            "image" => {
+                let data = object
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        de::Error::custom("MCP image content requires string field `data`")
+                    })?
+                    .to_owned();
+                let mime_type = object
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        de::Error::custom("MCP image content requires string field `mimeType`")
+                    })?
+                    .to_owned();
+                if object.len() == 3 {
+                    Ok(Self::Image { data, mime_type })
+                } else {
+                    Ok(Self::Raw(value))
+                }
+            }
+            _ => Ok(Self::Raw(value)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -198,10 +272,42 @@ mod tests {
 
     #[test]
     fn parse_call_tool_result_unknown_content_kind() {
-        // Forward-compat: unknown content types should round-trip into `Other`.
+        // Forward-compat: unknown content types retain their complete JSON
+        // shape instead of collapsing into a unit catch-all.
         let raw = r#"{"content":[{"type":"resource","uri":"file:///x"}]}"#;
         let result: CallToolResult = serde_json::from_str(raw).unwrap();
-        assert!(matches!(result.content[0], Content::Other));
+        match &result.content[0] {
+            Content::Raw(value) => {
+                assert_eq!(value["type"], "resource");
+                assert_eq!(value["uri"], "file:///x");
+            }
+            other => panic!("expected raw content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_call_tool_result_preserves_metadata_on_known_content() {
+        let raw = r#"{"content":[{"type":"text","text":"hello",
+            "annotations":{"priority":0.9},"_meta":{"cacheKey":"a"}}]}"#;
+        let result: CallToolResult = serde_json::from_str(raw).unwrap();
+        match &result.content[0] {
+            Content::Raw(value) => {
+                assert_eq!(value["text"], "hello");
+                assert_eq!(value["annotations"]["priority"], 0.9);
+                assert_eq!(value["_meta"]["cacheKey"], "a");
+            }
+            other => panic!("expected metadata-bearing content to stay raw, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_call_tool_result_preserves_result_meta() {
+        let raw = r#"{"_meta":{"requestId":"abc","cache":{"hit":true}},
+            "content":[{"type":"text","text":"hello"}]}"#;
+        let result: CallToolResult = serde_json::from_str(raw).unwrap();
+        let meta = result.meta.expect("top-level _meta should be preserved");
+        assert_eq!(meta["requestId"], "abc");
+        assert_eq!(meta["cache"]["hit"], true);
     }
 
     #[test]

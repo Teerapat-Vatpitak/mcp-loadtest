@@ -110,7 +110,22 @@ fn write_summary(out: &mut String, report: &Report) -> std::fmt::Result {
     write!(
         out,
         "<td class=\"num\">{deadlocks}</td></tr></tbody></table>"
-    )
+    )?;
+    if report.metrics.outcomes.expected_rejection > 0 {
+        write!(
+            out,
+            "<p><strong>Expected rejections:</strong> {}</p>",
+            fmt_count(report.metrics.outcomes.expected_rejection)
+        )?;
+    }
+    if report.scenario_outcome.teardown_failure_count > 0 {
+        write!(
+            out,
+            "<p><strong>Teardown failures:</strong> {}</p>",
+            fmt_count(report.scenario_outcome.teardown_failure_count)
+        )?;
+    }
+    Ok(())
 }
 
 fn push_latency_cell(

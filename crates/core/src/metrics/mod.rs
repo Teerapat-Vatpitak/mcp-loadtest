@@ -212,7 +212,7 @@ impl Recorder {
         let total = outcomes_snap.total();
         let throughput = ThroughputStats {
             total_requests: total,
-            successful_requests: outcomes_snap.success,
+            successful_requests: outcomes_snap.success + outcomes_snap.expected_rejection,
             requests_per_sec: requests_per_sec(self.inner.start, total),
         };
 
@@ -227,6 +227,7 @@ impl Recorder {
             malformed: outcomes_snap.malformed,
             disconnected: outcomes_snap.disconnected,
             cancelled: outcomes_snap.cancelled,
+            expected_rejection: outcomes_snap.expected_rejection,
         };
 
         ScenarioMetrics {
@@ -267,7 +268,7 @@ fn per_tool_snapshot(state: &PerToolState) -> ScenarioMetrics {
     let total = outcomes_snap.total();
     let throughput = ThroughputStats {
         total_requests: total,
-        successful_requests: outcomes_snap.success,
+        successful_requests: outcomes_snap.success + outcomes_snap.expected_rejection,
         requests_per_sec: requests_per_sec(state.start, total),
     };
 
@@ -282,6 +283,7 @@ fn per_tool_snapshot(state: &PerToolState) -> ScenarioMetrics {
         malformed: outcomes_snap.malformed,
         disconnected: outcomes_snap.disconnected,
         cancelled: outcomes_snap.cancelled,
+        expected_rejection: outcomes_snap.expected_rejection,
     };
 
     ScenarioMetrics {
@@ -319,6 +321,7 @@ mod tests {
         r.record(Duration::from_micros(0), CallOutcome::ServerError);
         r.record(Duration::from_micros(0), CallOutcome::Crash);
         r.record(Duration::from_micros(0), CallOutcome::Cancelled);
+        r.record(Duration::from_micros(0), CallOutcome::ExpectedRejection);
 
         let snap = r.snapshot();
 
@@ -328,11 +331,12 @@ mod tests {
         assert_eq!(snap.outcomes.server_error, 1);
         assert_eq!(snap.outcomes.crash, 1);
         assert_eq!(snap.outcomes.cancelled, 1);
+        assert_eq!(snap.outcomes.expected_rejection, 1);
         assert_eq!(snap.outcomes.deadlock, 0);
 
         // Throughput
-        assert_eq!(snap.throughput.total_requests, 6);
-        assert_eq!(snap.throughput.successful_requests, 2);
+        assert_eq!(snap.throughput.total_requests, 7);
+        assert_eq!(snap.throughput.successful_requests, 3);
 
         // Latency: only Success/Hang/Deadlock contribute → 3 samples
         assert_eq!(snap.latency.count, 3);
@@ -450,12 +454,13 @@ mod tests {
             CallOutcome::Malformed,
             CallOutcome::Disconnected,
             CallOutcome::Cancelled,
+            CallOutcome::ExpectedRejection,
         ] {
             r.record(Duration::from_micros(100), o);
         }
         let snap = r.snapshot();
         assert_eq!(snap.latency.count, 0);
-        assert_eq!(snap.throughput.total_requests, 7);
+        assert_eq!(snap.throughput.total_requests, 8);
     }
 
     #[test]

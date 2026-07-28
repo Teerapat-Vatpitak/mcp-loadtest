@@ -17,14 +17,47 @@ mod helpers;
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mcp_loadtest_core::config::{Config, ScenarioConfig, ServerConfig, ValidationConfig};
 use mcp_loadtest_core::metrics::Recorder;
 use mcp_loadtest_engine::scenario::sustained::Sustained;
 use mcp_loadtest_engine::scenario::{RunContext, Scenario};
-use mcp_loadtest_protocol::Session;
+use mcp_loadtest_engine::{Run, RunError};
+use mcp_loadtest_protocol::{Session, SessionError};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
+
+const TEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Unique per-test run root; parallel nextest processes must never share it.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn new(tag: &str) -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "mcp-loadtest-strict-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create strict test scratch directory");
+        Self(path)
+    }
+
+    fn path(&self) -> PathBuf {
+        self.0.clone()
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 fn make_ctx() -> (RunContext, Recorder) {
     let metrics = Recorder::new();
@@ -156,7 +189,7 @@ async fn strict_rejects_args_violating_advertised_schema() {
         snap.outcomes
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(TEST_SHUTDOWN_TIMEOUT, session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
@@ -194,7 +227,7 @@ async fn strict_allows_schema_compliant_args() {
         "compliant args must not produce ProtocolError"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(TEST_SHUTDOWN_TIMEOUT, session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
@@ -217,7 +250,7 @@ async fn strict_result_conformant_passes_silently() {
         "structuredContent must round-trip unaltered"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(TEST_SHUTDOWN_TIMEOUT, session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
@@ -243,7 +276,7 @@ async fn strict_result_violation_warns_but_does_not_gate() {
         "violating structuredContent must be passed through unaltered"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(TEST_SHUTDOWN_TIMEOUT, session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
@@ -266,8 +299,77 @@ async fn strict_result_missing_structured_content_warns_but_does_not_gate() {
         "no structuredContent was sent, so none must be synthesized"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(TEST_SHUTDOWN_TIMEOUT, session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
+}
+
+#[tokio::test]
+async fn strict_run_fails_closed_when_tools_list_fails() {
+    let scratch = ScratchDir::new("tools-list-error");
+    let fixture = helpers::fixture_path("mock-tools-list-error.py");
+    let server = ServerConfig::stdio(
+        helpers::python(),
+        vec![fixture.to_string_lossy().into_owned()],
+    );
+    let mut validation = ValidationConfig::default();
+    validation.strict = true;
+    let config = Config::new(
+        server,
+        ScenarioConfig::new("sustained", json!({ "tool": "echo" })),
+    )
+    .with_validation(validation);
+    let scenario = Box::new(Sustained {
+        concurrent: 1,
+        duration: Duration::from_millis(100),
+        tool: "echo".to_owned(),
+        args: json!({ "msg": 123 }),
+    });
+
+    let error = Run::new(config, scenario, scratch.path())
+        .execute()
+        .await
+        .expect_err("strict mode must not run without a tools/list schema registry");
+
+    match error {
+        RunError::Session(SessionError::Server(server_error)) => {
+            assert_eq!(server_error.code, -32603);
+            assert_eq!(server_error.message, "intentional tools/list failure");
+        }
+        other => panic!("expected tools/list Server error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn non_strict_run_also_fails_closed_when_tools_list_fails() {
+    let scratch = ScratchDir::new("tools-list-error-non-strict");
+    let fixture = helpers::fixture_path("mock-tools-list-error.py");
+    let server = ServerConfig::stdio(
+        helpers::python(),
+        vec![fixture.to_string_lossy().into_owned()],
+    );
+    let config = Config::new(
+        server,
+        ScenarioConfig::new("sustained", json!({ "tool": "echo" })),
+    );
+    let scenario = Box::new(Sustained {
+        concurrent: 1,
+        duration: Duration::from_millis(100),
+        tool: "echo".to_owned(),
+        args: json!({ "msg": "the fixture would accept this call" }),
+    });
+
+    let error = Run::new(config, scenario, scratch.path())
+        .execute()
+        .await
+        .expect_err("discovery is a protocol precondition even when schema validation is disabled");
+
+    match error {
+        RunError::Session(SessionError::Server(server_error)) => {
+            assert_eq!(server_error.code, -32603);
+            assert_eq!(server_error.message, "intentional tools/list failure");
+        }
+        other => panic!("expected tools/list Server error, got {other:?}"),
+    }
 }

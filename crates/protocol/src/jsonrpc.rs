@@ -5,7 +5,7 @@
 //!
 //! [JSON-RPC 2.0]: https://www.jsonrpc.org/specification
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -44,19 +44,57 @@ pub(crate) struct OutgoingNotification<'a, P: ?Sized + Serialize> {
 }
 
 /// A response from the server, carrying either a result or an error.
-#[expect(
-    dead_code,
-    reason = "serde populates `jsonrpc` via Deserialize but we never read it (we trust the server); dead_code can't see the runtime use"
-)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub(crate) struct ResponseEnvelope {
-    /// JSON-RPC version (always `"2.0"` from compliant servers).
+    /// JSON-RPC version, validated as exactly `"2.0"` by the session.
     pub jsonrpc: String,
-    /// Response id, matching the corresponding request's id.
-    pub id: u64,
+    /// Response id. JSON-RPC permits string, number, or null; the session
+    /// validates it against its numeric outgoing id after parsing so a
+    /// well-formed but mismatched/null id is not misreported as malformed
+    /// JSON.
+    pub id: Value,
     /// Either a successful result or a structured error.
-    #[serde(flatten)]
     pub payload: ResponsePayload,
+}
+
+impl<'de> Deserialize<'de> for ResponseEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawEnvelope {
+            jsonrpc: String,
+            id: Value,
+            #[serde(flatten)]
+            members: serde_json::Map<String, Value>,
+        }
+
+        let mut raw = RawEnvelope::deserialize(deserializer)?;
+        let result = raw.members.remove("result");
+        let error = raw.members.remove("error");
+        let payload = match (result, error) {
+            (Some(result), None) => ResponsePayload::Ok { result },
+            (None, Some(error)) => ResponsePayload::Err {
+                error: serde_json::from_value(error).map_err(de::Error::custom)?,
+            },
+            (Some(_), Some(_)) => {
+                return Err(de::Error::custom(
+                    "JSON-RPC response cannot contain both `result` and `error`",
+                ));
+            }
+            (None, None) => {
+                return Err(de::Error::custom(
+                    "JSON-RPC response requires exactly one of `result` or `error`",
+                ));
+            }
+        };
+        Ok(Self {
+            jsonrpc: raw.jsonrpc,
+            id: raw.id,
+            payload,
+        })
+    }
 }
 
 /// The success-or-error half of a JSON-RPC response.
@@ -104,7 +142,7 @@ mod tests {
     fn parse_response_ok() {
         let raw = r#"{"jsonrpc":"2.0","id":1,"result":{"foo":"bar"}}"#;
         let env: ResponseEnvelope = serde_json::from_str(raw).unwrap();
-        assert_eq!(env.id, 1);
+        assert_eq!(env.id, serde_json::json!(1));
         match env.payload {
             ResponsePayload::Ok { result } => {
                 assert_eq!(result["foo"], "bar");
@@ -118,7 +156,7 @@ mod tests {
         let raw =
             r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"method not found"}}"#;
         let env: ResponseEnvelope = serde_json::from_str(raw).unwrap();
-        assert_eq!(env.id, 2);
+        assert_eq!(env.id, serde_json::json!(2));
         match env.payload {
             ResponsePayload::Err { error } => {
                 assert_eq!(error.code, -32601);
@@ -126,5 +164,32 @@ mod tests {
             }
             ResponsePayload::Ok { .. } => panic!("expected Err"),
         }
+    }
+
+    #[test]
+    fn response_requires_exactly_one_result_or_error() {
+        for raw in [
+            r#"{"jsonrpc":"2.0","id":1}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-32603,"message":"bad"}}"#,
+        ] {
+            let error = serde_json::from_str::<ResponseEnvelope>(raw)
+                .expect_err("ambiguous response envelope must be rejected");
+            assert!(
+                error.to_string().contains("result") && error.to_string().contains("error"),
+                "unexpected diagnostic: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn null_is_a_present_success_result() {
+        let raw = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
+        let env: ResponseEnvelope = serde_json::from_str(raw).unwrap();
+        assert!(matches!(
+            env.payload,
+            ResponsePayload::Ok {
+                result: Value::Null
+            }
+        ));
     }
 }

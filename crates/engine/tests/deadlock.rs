@@ -11,9 +11,15 @@ use std::time::{Duration, Instant};
 use mcp_loadtest_core::metrics::Recorder;
 use mcp_loadtest_engine::scenario::deadlock_probe::DeadlockProbe;
 use mcp_loadtest_engine::scenario::{RunContext, Scenario};
-use mcp_loadtest_protocol::Session;
+use mcp_loadtest_protocol::transport::spawn_options::SpawnOptions;
+use mcp_loadtest_protocol::{Session, SessionFactory};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
+
+// This integration binary starts up to five Python workers at once while
+// nextest may be saturating the host with other process-heavy tests. Keep the
+// wider budget test-local; Session's production default remains 10 seconds.
+const TEST_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn make_ctx() -> RunContext {
     RunContext::new(
@@ -25,14 +31,40 @@ fn make_ctx() -> RunContext {
     )
 }
 
+fn fixture_factory(fixture: &str) -> SessionFactory {
+    let mock = helpers::fixture_path(fixture);
+    let py = helpers::python();
+    SessionFactory::new(move || {
+        let mock = mock.clone();
+        let py = py.clone();
+        async move {
+            Session::spawn_with_timeout(
+                &py,
+                [mock.as_os_str()],
+                SpawnOptions::inherit(),
+                TEST_STARTUP_TIMEOUT,
+            )
+            .await
+        }
+    })
+}
+
+async fn spawn_fixture(fixture: &str) -> Session {
+    let mock = helpers::fixture_path(fixture);
+    let py = helpers::python();
+    Session::spawn_with_timeout(
+        &py,
+        [mock.as_os_str()],
+        SpawnOptions::inherit(),
+        TEST_STARTUP_TIMEOUT,
+    )
+    .await
+    .expect("spawn failed")
+}
+
 #[tokio::test]
 async fn mock_normal_no_deadlock() {
-    let mock = helpers::fixture_path("mock-normal.py");
-    let py = helpers::python();
-
-    let mut session = Session::spawn(&py, [mock.as_os_str()])
-        .await
-        .expect("spawn failed");
+    let mut session = spawn_fixture("mock-normal.py").await;
 
     let probe = DeadlockProbe {
         concurrent: 5,
@@ -42,7 +74,7 @@ async fn mock_normal_no_deadlock() {
         args: json!({ "msg": "hi" }),
     };
 
-    let ctx = make_ctx();
+    let ctx = make_ctx().with_session_factory(fixture_factory("mock-normal.py"));
     let outcome = probe.drive(&mut session, &ctx).await;
 
     assert_eq!(
@@ -60,7 +92,7 @@ async fn mock_normal_no_deadlock() {
     assert_eq!(outcome.hang_count, 0, "no slow calls expected: {outcome:?}");
     assert_eq!(outcome.error_count, 0, "no errors expected: {outcome:?}");
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
@@ -73,12 +105,7 @@ async fn mock_normal_no_deadlock() {
 /// deadlock and bail out of the iteration loop.
 #[tokio::test]
 async fn mock_broken_detects_deadlock() {
-    let mock = helpers::fixture_path("mock-broken.py");
-    let py = helpers::python();
-
-    let mut session = Session::spawn(&py, [mock.as_os_str()])
-        .await
-        .expect("spawn failed");
+    let mut session = spawn_fixture("mock-broken.py").await;
 
     let probe = DeadlockProbe {
         concurrent: 5,
@@ -88,7 +115,7 @@ async fn mock_broken_detects_deadlock() {
         args: json!({ "msg": "hi" }),
     };
 
-    let ctx = make_ctx();
+    let ctx = make_ctx().with_session_factory(fixture_factory("mock-broken.py"));
     let outcome = probe.drive(&mut session, &ctx).await;
 
     assert!(
@@ -115,6 +142,9 @@ async fn mock_broken_detects_deadlock() {
         "each hung_for duration should be >= the 200ms hang_threshold: {outcome:?}"
     );
 
-    // After a deadlock the session is wedged; shutdown is best-effort.
-    let _ = tokio::time::timeout(Duration::from_secs(5), session.shutdown()).await;
+    // After a deadlock the transport must still kill, reap, and drain.
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("shutdown errored");
 }

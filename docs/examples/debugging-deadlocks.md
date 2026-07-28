@@ -11,7 +11,7 @@ how the canonical example — Vibe-Trading PR #85 — was actually fixed.
 $ mcp-loadtest deadlock-probe \
     --server "python agent/mcp_server.py" \
     --tool analyze_options \
-    --concurrent 5 \
+    --concurrent 1 \
     --hang-threshold 2s \
     --grace-period 5s \
     --args '{"spot":450,"strike":460,"expiry_days":30}'
@@ -25,7 +25,6 @@ Deadlocks: 1   Hangs: 0   Errors: 0
   deadlock detected: tool=analyze_options iter=0 hung_for=7012ms
 
 Report: runs/01KR9JX7E4P638TKQM96YA0B4Z/report.md
-Stderr: runs/01KR9JX7E4P638TKQM96YA0B4Z/server.stderr.log
 
 Error: DEADLOCK DETECTED — 1 deadlock(s), 0 error(s), 0 threshold violation(s)
 ```
@@ -37,21 +36,57 @@ Three things matter here:
   declared the call dead. See [DESIGN.md §15.1](../../DESIGN.md#151-hang-detector)
   for the hang-detector spec.
 - **`iter=0`** — the very first call hung. This is the lazy-init fingerprint.
-  If the same call worked five times and the sixth deadlocked, you'd be
-  looking at a state-corruption bug, not a lazy-init one.
-- **`runs/<ulid>/`** — every run drops a self-contained directory with the
-  markdown report, machine-readable `metrics.json`, captured server stderr,
-  and trace events. Everything you need to triage is in there.
+  Start with `--concurrent 1` for this focused diagnosis. With
+  `--concurrent N`, N independent sessions finish their handshakes and
+  release one call each through a shared gate, so multiple workers can report
+  the same first-call failure.
+- **`runs/<ulid>/`** — the quick subcommand writes `report.md` and
+  machine-readable `metrics.json`. It inherits the server's stderr and does
+  not record a trace. Use the config-driven `run` form below when you need
+  captured stderr or wire frames.
 
 ## Read the stderr first
 
-`mcp-loadtest` always captures the server's stderr to
-`runs/<ulid>/server.stderr.log`. Lazy-init bugs usually log *something* on the
-way down — an `ImportError`, a thread-stack dump from a signal handler, a
-half-emitted log line. Open it:
+The quick `deadlock-probe` subcommand inherits the stdio server's stderr. For a
+reproducible file, express the same probe in a config and use `run`:
+
+```toml
+# deadlock.toml
+[server]
+command = "python"
+args = ["agent/mcp_server.py"]
+transport = "stdio"
+
+[scenario]
+type = "deadlock_probe"
+concurrent = 5
+tool = "analyze_options"
+args = { spot = 450, strike = 460, expiry_days = 30 }
+hang_threshold = "2s"
+grace_period = "5s"
+
+[output]
+report_dir = "./runs"
+formats = ["terminal", "markdown", "json"]
+```
 
 ```bash
-$ cat runs/01KR9JX7E4P638TKQM96YA0B4Z/server.stderr.log
+mcp-loadtest run --config deadlock.toml \
+  --capture-stderr \
+  --trace ./deadlock-trace.jsonl
+```
+
+`--capture-stderr` writes the initial session to
+`runs/<ulid>/server-stderr.log`; `--tee-stderr` writes the same file and
+mirrors it live. Pooled and cold-start sessions each get a non-truncating
+artifact at `runs/<ulid>/server-stderr/session-NNNNNN.log`, so inspect those
+worker files for concurrency-only failures. These flags apply to `run`, not
+to the quick `deadlock-probe` subcommand. Lazy-init bugs usually log
+*something* on the way down—an `ImportError`, a thread-stack dump, or a
+half-emitted line. Open the captured file:
+
+```bash
+$ cat runs/01KR9JX7E4P638TKQM96YA0B4Z/server-stderr.log
 INFO:mcp.server:starting on stdio
 INFO:fastmcp.tools:registered 12 tools
 INFO:fastmcp.session:initialize ok
@@ -63,28 +98,25 @@ INFO:fastmcp.session:tools/call analyze_options
 Stderr just stops. No exception, no `Got SIGTERM` line — the thread is
 blocked but the process is alive. That's the lazy-init signature.
 
-If you want stderr live (handy in development), add `--tee-stderr` to the
-command — it streams to your terminal in addition to the log file.
-
 ## Inspect the trace
 
-`trace.jsonl` is one event per line. Filter for the hang record:
+`mcp-trace/1` contains a header followed by raw client→server and
+server→client JSON-RPC frames. It does **not** contain synthetic `deadlock`
+events. Filter the recorded calls and compare their ids:
 
 ```bash
-$ jq 'select(.kind=="deadlock")' runs/01KR9JX7E4P638TKQM96YA0B4Z/trace.jsonl
-{
-  "ts": 7.012,
-  "kind": "deadlock",
-  "request_id": 3,
-  "method": "tools/call",
-  "params": {"name": "analyze_options", "arguments": {...}},
-  "duration_ms": 7012.4
-}
+jq -r '
+  select(.method == "tools/call") |
+  {dir, elapsed_ms, message: (.body | fromjson)}
+' ./deadlock-trace.jsonl
 ```
 
-`request_id=3` is the JSON-RPC id of the call that never returned. Pair that
-with the server-side log (`request_id` shows up in most MCP SDK logs) and
-you've got the offending call.
+A client-to-server request id with no matching server-to-client response is
+the wire-level symptom. The report supplies the `hung_for` classification;
+the trace supplies the exact request body. Client-side traces redact
+secret-looking keys under `params.arguments` by default, but a server can
+still echo sensitive data in its response—treat trace files as artifacts that
+may contain secrets.
 
 ## Identify the bug class
 
@@ -140,7 +172,7 @@ PR [#86](https://github.com/HKUDS/Vibe-Trading/pull/86) added a regression
 smoke that spawns the server, calls `analyze_options`, and asserts a
 response within 5 seconds. `mcp-loadtest` does the same thing at higher
 pressure and tighter latency budgets — see
-[`crates/mcp-loadtest/tests/vibe_trading_regression.rs`](../../crates/mcp-loadtest/tests/vibe_trading_regression.rs),
+[`crates/engine/tests/vibe_trading_regression.rs`](../../crates/engine/tests/vibe_trading_regression.rs),
 which is pinned to commit `71220c7c` (the parent of PR #85) and proves the
 bug class is detected against the actual buggy code.
 
@@ -167,20 +199,23 @@ async fn first_tool_call_does_not_deadlock() {
         .expect("spawn failed");
 
     let probe = DeadlockProbe {
-        concurrent: 5,
+        // A directly-constructed RunContext has no SessionFactory, so this
+        // embedded example uses the focused one-session path. `Run::execute`
+        // attaches a factory automatically for synchronized N>1 probes.
+        concurrent: 1,
         hang_threshold: Duration::from_secs(2),
         grace_period: Duration::from_secs(5),
         tool: "get_market_data".into(),
         args: json!({ "ticker": "AAPL" }),
     };
 
-    let ctx = RunContext {
-        run_start: Instant::now(),
-        cancel_token: CancellationToken::new(),
-        metrics: Recorder::new(),
-        hang_threshold: Duration::from_secs(2),
-        grace_period: Duration::from_secs(5),
-    };
+    let ctx = RunContext::new(
+        Instant::now(),
+        CancellationToken::new(),
+        Recorder::new(),
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+    );
 
     let outcome = probe.drive(&mut session, &ctx).await;
 
@@ -200,10 +235,11 @@ on a bug class that used to surface as a flaky timeout in production.
 
 1. **Reproduce.** Run `mcp-loadtest deadlock-probe` against your server with
    the same args your test does. Confirm the deadlock is deterministic.
-2. **Capture stderr.** `cat runs/<ulid>/server.stderr.log`. Look for the last
-   line before silence.
-3. **Find the wedged request.** `jq 'select(.kind=="deadlock")' trace.jsonl`
-   — get the `request_id`, `method`, and `params`.
+2. **Capture stderr.** Re-run the config form with `--capture-stderr`, then
+   inspect `runs/<ulid>/server-stderr.log` and, for pooled/cold-start runs,
+   each file under `runs/<ulid>/server-stderr/`.
+3. **Find the wedged request.** Re-run with `--trace <file>`, filter frames
+   whose `.method == "tools/call"`, and find the request id without a response.
 4. **Inspect the handler.** For the tool in the wedged call, walk the code
    path from "JSON-RPC arrives" to "response sent." Look for the three
    patterns above (lazy import, sync I/O in async, cross-task lock).
@@ -222,5 +258,5 @@ on a bug class that used to surface as a flaky timeout in production.
   probe algorithm spec.
 - [DESIGN.md §18](../../DESIGN.md#18-error-taxonomy) — how `Hang`,
   `Deadlock`, `Timeout`, and `Crash` are classified differently.
-- [`crates/mcp-loadtest/tests/vibe_trading_regression.rs`](../../crates/mcp-loadtest/tests/vibe_trading_regression.rs)
+- [`crates/engine/tests/vibe_trading_regression.rs`](../../crates/engine/tests/vibe_trading_regression.rs)
   — the worked example pinned to the actual buggy commit.

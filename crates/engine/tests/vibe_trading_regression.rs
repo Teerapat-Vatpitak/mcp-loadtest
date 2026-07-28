@@ -58,7 +58,7 @@ use std::time::{Duration, Instant};
 use mcp_loadtest_core::metrics::Recorder;
 use mcp_loadtest_engine::scenario::deadlock_probe::DeadlockProbe;
 use mcp_loadtest_engine::scenario::{RunContext, Scenario};
-use mcp_loadtest_protocol::Session;
+use mcp_loadtest_protocol::{Session, SessionFactory};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -277,10 +277,8 @@ async fn deadlock_probe_catches_vibe_trading_pr85_bug() {
     };
 
     let probe = DeadlockProbe {
-        // 5 concurrent calls is enough to trip the lazy-init regardless of
-        // which call wins the worker thread first. The probe is sequential
-        // (M2 limitation) but the buggy server hangs on call #1 anyway —
-        // the deadlock happens before tool argument validation.
+        // 5 synchronized sessions are enough to trip the lazy-init regardless
+        // of which process reaches the buggy registry first.
         concurrent: 5,
         hang_threshold: Duration::from_secs(2),
         grace_period: Duration::from_secs(5),
@@ -295,13 +293,24 @@ async fn deadlock_probe_catches_vibe_trading_pr85_bug() {
         }),
     };
 
-    let ctx = make_ctx();
+    let factory = {
+        let py = py.clone();
+        let server_script = server_script.clone();
+        SessionFactory::new(move || {
+            let py = py.clone();
+            let server_script = server_script.clone();
+            async move { Session::spawn(&py, [server_script.as_os_str()]).await }
+        })
+    };
+    let ctx = make_ctx().with_session_factory(factory);
     let outcome = probe.drive(&mut session, &ctx).await;
 
     eprintln!("vibe-trading regression outcome: {outcome:?}");
 
-    // Best-effort shutdown — the session is wedged after a deadlock.
-    let _ = tokio::time::timeout(Duration::from_secs(5), session.shutdown()).await;
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("shutdown errored");
 
     assert!(
         outcome.deadlock_count >= 1,

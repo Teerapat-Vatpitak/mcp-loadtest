@@ -20,7 +20,8 @@ pub(super) fn sustained_load_def() -> Value {
         "name": "sustained_load",
         "description":
             "Run a sustained constant-load workload against an MCP server for the \
-             given duration. Returns latency percentiles + error rate + throughput.",
+             given duration. Returns latency, error rate, throughput, and a \
+             fail-closed `passed` signal.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -35,7 +36,7 @@ pub(super) fn sustained_load_def() -> Value {
                 "concurrent": {
                     "type": "integer",
                     "default": 10,
-                    "description": "Declared concurrency (M2: serialized on one session)."
+                    "description": "Independent session workers."
                 },
                 "duration_ms": {
                     "type": "integer",
@@ -92,6 +93,7 @@ pub(super) async fn sustained_load(args: &Value) -> Result<Value, ToolError> {
     };
 
     Ok(json!({
+        "passed": report.passed(),
         "p50_ms": duration_to_ms(report.metrics.latency.p50),
         "p95_ms": duration_to_ms(report.metrics.latency.p95),
         "p99_ms": duration_to_ms(report.metrics.latency.p99),
@@ -100,6 +102,9 @@ pub(super) async fn sustained_load(args: &Value) -> Result<Value, ToolError> {
         "requests_per_sec": report.metrics.throughput.requests_per_sec,
         "total_requests": total,
         "successful_requests": success,
+        "incomplete_worker_count": report.scenario_outcome.incomplete_worker_count,
+        "teardown_failure_count": report.scenario_outcome.teardown_failure_count,
+        "threshold_violation_count": report.threshold_violations.len(),
         "run_id": report.run_id,
     }))
 }

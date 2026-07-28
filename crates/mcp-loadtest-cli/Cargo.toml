@@ -21,11 +21,12 @@ rust-version.workspace = true
 # mcp-loadtest-<tag>-<target>/ directory containing mcp-loadtest[.exe].
 # If release.yml's naming ever changes, change these templates in lockstep.
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/mcp-loadtest-v{ version }-{ target }{ archive-suffix }"
+pkg-url = "{ repo }/releases/download/v{ version }/mcp-loadtest-v{ version }-{ target }.tar.gz"
 bin-dir = "mcp-loadtest-v{ version }-{ target }/{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/mcp-loadtest-v{ version }-{ target }.zip"
 pkg-fmt = "zip"
 
 [lints]
@@ -43,7 +44,7 @@ doc = false
 [dependencies]
 # CLI binary needs both `serve` (for `mcp-loadtest serve --mcp`) and `tui`
 # (for the live dashboard) subcommands.
-mcp-loadtest = { path = "../mcp-loadtest", version = "0.0.1", features = ["serve", "tui"] }
+mcp-loadtest = { path = "../mcp-loadtest", version = "0.1.0", features = ["serve", "tui"] }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

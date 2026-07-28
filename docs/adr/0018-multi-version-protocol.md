@@ -3,6 +3,28 @@
 Date: 2026-07-07
 Status: Accepted (user approved proceeding to Phase 1, 2026-07-07)
 
+**Final-reconciliation annotation (2026-07-29):** the final `2026-07-28`
+specification is published at commit
+`5f5440bb26a62e2cf3440b92da5a667efa03b267`. ADR 0023 reconciles the
+implemented tools/discovery/request-metadata/header subset to that final
+revision. The implementation remains explicit and experimental because its
+scope is intentionally narrow; it is not a full-protocol, auth, MRTR,
+subscriptions, or schema-reference claim. Official conformance commit
+`49103de6ed70804e940637bf3e9e29e4a3f54e64` remains DRAFT/provisional for
+this revision, so ADR 0023 treats final tag/schema reconciliation and the
+latest official harness run as separate evidence. This annotation supersedes
+the pre-final release-truth paragraph immediately below without rewriting the
+historical decision.
+
+**Historical release-truth annotation (2026-07-28; superseded by
+[ADR 0023](0023-mcp-2026-final-reconciliation.md)):** the dated `2026-07-28` final
+specification had not been published when `v0.1.0` was prepared. That path is
+experimental, explicitly selected, and never the default/final-support claim.
+It is pinned to official spec commit
+`7d6c7b86eb2f1442051849ca76429fde3c3008b0` and conformance commit
+`49103de6ed70804e940637bf3e9e29e4a3f54e64`. References to `v0.0.1` below are
+historical planning text; that version was never tagged or released.
+
 ## Context
 
 The MCP spec now moves faster than our release cadence:

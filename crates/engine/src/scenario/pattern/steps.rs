@@ -12,7 +12,7 @@ use mcp_loadtest_core::metrics::CallOutcome;
 use mcp_loadtest_protocol::Session;
 
 use super::{ErrorBehavior, Pattern};
-use crate::scenario::{RunContext, classify_error, is_terminal_error};
+use crate::scenario::{RunContext, classify_error, is_logical_tool_error, is_terminal_error};
 
 /// Stats from a single [`execute`] call (one pattern iteration).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +98,14 @@ pub async fn execute<R: Rng + ?Sized>(
 
         let elapsed = call_start.elapsed();
         match result {
+            Ok(tool_result) if is_logical_tool_error(&tool_result) => {
+                stats.errors += 1;
+                ctx.metrics
+                    .record_tool(&step.tool, elapsed, CallOutcome::ServerError);
+                if matches!(pattern.on_step_error, ErrorBehavior::Abort) {
+                    break;
+                }
+            }
             Ok(_) => {
                 stats.steps_succeeded += 1;
                 ctx.metrics

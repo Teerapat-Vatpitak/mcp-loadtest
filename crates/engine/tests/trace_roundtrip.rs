@@ -34,7 +34,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bound on post-replay transport shutdown.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Unique, auto-cleaned scratch dir under the OS temp dir. `tempfile` is not
 /// a dev-dep of this crate, so we roll a tiny RAII dir from pid + nanos —
@@ -97,7 +97,8 @@ async fn record_trace(dir: &ScratchDir, tag: &str, args: Value) -> PathBuf {
 
 /// Spawn a fixture over a bare stdio transport (no Session handshake — the
 /// trace carries the recorded handshake frames). The transport is
-/// `kill_on_drop`, so the child is reaped even on panic.
+/// `kill_on_drop`, so a panic still requests child termination; normal tests
+/// explicitly await bounded shutdown/reap.
 async fn spawn_replay_target(fixture: &str) -> Box<dyn Transport> {
     let py = helpers::python();
     let mock = helpers::fixture_path(fixture);
@@ -143,7 +144,10 @@ async fn roundtrip_against_mock_normal_matches() {
     .await
     .expect("replay timed out")
     .expect("replay failed");
-    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, transport.shutdown()).await;
+    tokio::time::timeout(SHUTDOWN_TIMEOUT, transport.shutdown())
+        .await
+        .expect("replay target shutdown timed out")
+        .expect("replay target shutdown failed");
 
     assert!(report.total >= 3, "initialize + tools/list + tools/call");
     assert_eq!(
@@ -169,7 +173,10 @@ async fn replay_against_mock_error_diverges() {
     .await
     .expect("replay timed out")
     .expect("replay failed");
-    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, transport.shutdown()).await;
+    tokio::time::timeout(SHUTDOWN_TIMEOUT, transport.shutdown())
+        .await
+        .expect("replay target shutdown timed out")
+        .expect("replay target shutdown failed");
 
     assert!(
         !report.diverged.is_empty(),

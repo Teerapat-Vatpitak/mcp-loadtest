@@ -20,15 +20,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::scenario::{RunContext, Scenario, ScenarioOutcome, classify_error, is_terminal_error};
+use crate::scenario::{
+    RunContext, Scenario, ScenarioOutcome, classify_error, is_terminal_error, teardown,
+};
 use mcp_loadtest_core::metrics::CallOutcome;
 use mcp_loadtest_protocol::Session;
 use mcp_loadtest_protocol::hang_detector::{HangOutcome, hang_detect};
 use mcp_loadtest_protocol::mcp::ProtocolVersion;
-
-/// Bounded best-effort shutdown per revision — a revision that deadlocked
-/// leaves a wedged session behind; it must not hold up the next row.
-const ROW_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Drive the same server once per protocol revision and diff the outcomes.
 pub struct VersionMatrix {
@@ -114,16 +112,30 @@ impl Scenario for VersionMatrix {
                 outcome.total_calls += 1;
                 let call = session.call_tool(&self.tool, &self.args);
                 match hang_detect(call, ctx.hang_threshold, ctx.grace_period).await {
-                    HangOutcome::Ok { duration, .. } => {
-                        ok += 1;
-                        outcome.successful_calls += 1;
-                        ctx.metrics
-                            .record_tool(&key, duration, CallOutcome::Success);
+                    HangOutcome::Ok { result, duration } => {
+                        if super::is_logical_tool_error(&result) {
+                            errors += 1;
+                            outcome.error_count += 1;
+                            ctx.metrics
+                                .record_tool(&key, duration, CallOutcome::ServerError);
+                        } else {
+                            ok += 1;
+                            outcome.successful_calls += 1;
+                            ctx.metrics
+                                .record_tool(&key, duration, CallOutcome::Success);
+                        }
                     }
-                    HangOutcome::Slow { duration, .. } => {
-                        hangs += 1;
-                        outcome.hang_count += 1;
-                        ctx.metrics.record_tool(&key, duration, CallOutcome::Hang);
+                    HangOutcome::Slow { result, duration } => {
+                        if super::is_logical_tool_error(&result) {
+                            errors += 1;
+                            outcome.error_count += 1;
+                            ctx.metrics
+                                .record_tool(&key, duration, CallOutcome::ServerError);
+                        } else {
+                            hangs += 1;
+                            outcome.hang_count += 1;
+                            ctx.metrics.record_tool(&key, duration, CallOutcome::Hang);
+                        }
                     }
                     HangOutcome::Deadlock { hung_for } => {
                         deadlocks += 1;
@@ -169,9 +181,9 @@ impl Scenario for VersionMatrix {
                 "{key}: ok={ok} hangs={hangs} deadlocks={deadlocks} errors={errors}"
             ));
 
-            // Best-effort bounded teardown; a wedged row must not stall the
-            // matrix.
-            let _ = tokio::time::timeout(ROW_SHUTDOWN_TIMEOUT, session.shutdown()).await;
+            // Bounded teardown; a wedged row must not stall the matrix, but an
+            // uncertain lifecycle must remain a typed report-gating signal.
+            teardown::shutdown_session(session, &mut outcome, format!("{key} row")).await;
         }
 
         outcome

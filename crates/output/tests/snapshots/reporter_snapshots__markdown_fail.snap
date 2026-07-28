@@ -1,10 +1,10 @@
 ---
-source: crates/mcp-loadtest/tests/reporter_snapshots.rs
+source: crates/output/tests/reporter_snapshots.rs
 expression: md
 ---
 # Run 01HXYTESTFAIL00000000000000
 
-**Status:** ❌ FAIL (1 threshold violation)
+**Status:** ❌ FAIL (2 teardown failures, 10 protocol/malformed outcomes, 5 terminal session outcomes, 1 threshold violation)
 **Server:** `python -m vibe_trading_mcp`
 **Scenario:** sustained
 **Started:** 2026-05-10T07:30:00Z
@@ -14,6 +14,7 @@ expression: md
 - Throughput: 205.75 req/s
 - Error rate: 0.36%
 - Deadlocks: 0  Hangs: 0
+- Teardown failures: 2
 
 ## Latency
 | p50 | p95 | p99 | p999 | max |

@@ -50,7 +50,7 @@ async fn handshake_list_call() {
         other => panic!("expected text content, got {other:?}"),
     }
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");

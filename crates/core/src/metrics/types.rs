@@ -37,6 +37,11 @@ pub enum CallOutcome {
     Disconnected,
     /// Caller-side cancellation.
     Cancelled,
+    /// A deliberately malformed fuzz probe was rejected as expected.
+    ///
+    /// This is a successful scenario outcome, but remains distinct from an
+    /// ordinary successful tool call for diagnostic reporting.
+    ExpectedRejection,
 }
 
 impl CallOutcome {
@@ -90,7 +95,8 @@ pub struct LatencyStats {
 pub struct ThroughputStats {
     /// Total calls attempted (success + failures).
     pub total_requests: u64,
-    /// Calls that returned `CallOutcome::Success`.
+    /// Calls that returned [`CallOutcome::Success`] or
+    /// [`CallOutcome::ExpectedRejection`].
     pub successful_requests: u64,
     /// Mean requests-per-second over the run.
     pub requests_per_sec: f64,
@@ -119,6 +125,8 @@ pub struct OutcomeCounts {
     pub disconnected: u64,
     /// Count of [`CallOutcome::Cancelled`].
     pub cancelled: u64,
+    /// Count of [`CallOutcome::ExpectedRejection`].
+    pub expected_rejection: u64,
 }
 
 #[cfg(test)]
@@ -159,6 +167,7 @@ mod tests {
         assert_eq!(s.malformed, 0);
         assert_eq!(s.disconnected, 0);
         assert_eq!(s.cancelled, 0);
+        assert_eq!(s.expected_rejection, 0);
     }
 
     #[test]
@@ -174,6 +183,7 @@ mod tests {
             CallOutcome::Malformed,
             CallOutcome::Disconnected,
             CallOutcome::Cancelled,
+            CallOutcome::ExpectedRejection,
         ] {
             assert!(!o.contributes_to_latency(), "{o:?} should not contribute");
         }

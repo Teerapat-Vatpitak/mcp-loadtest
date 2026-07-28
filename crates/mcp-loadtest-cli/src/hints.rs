@@ -71,7 +71,19 @@ impl ErrorHint for SessionError {
                  emitting non-protocol output on stdout; capture stderr with \
                  `--capture-stderr`",
             ),
-            SessionError::IdMismatch { .. } => Some(
+            SessionError::ResponseShape(_) => Some(
+                "the server returned valid JSON-RPC with a result that does not match \
+                 the requested MCP method — check server method routing and response \
+                 schemas",
+            ),
+            SessionError::InvalidJsonRpcVersion { .. } => Some(
+                "the server response is not JSON-RPC 2.0 — fix the server's response \
+                 envelope version",
+            ),
+            SessionError::IdMismatch { .. }
+            | SessionError::InvalidResponseId { .. }
+            | SessionError::MismatchedSuccessResponse { .. }
+            | SessionError::MismatchedErrorResponse { .. } => Some(
                 "server replied with a mismatched JSON-RPC id — it is not correlating \
                  request/response ids correctly (a server bug)",
             ),

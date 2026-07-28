@@ -23,8 +23,10 @@ pub enum ProtocolVersion {
     /// The 2026-07-28 revision — stateless core: no `initialize` handshake,
     /// `_meta` on every request, `server/discover` (ADR 0019). Selecting it
     /// switches the client's connection to the stateless mode instead of
-    /// participating in handshake negotiation. Implemented against the
-    /// release candidate; re-verified against the final spec (2026-07-28).
+    /// participating in handshake negotiation. Reconciled against the final
+    /// specification at `5f5440bb26a62e2cf3440b92da5a667efa03b267`.
+    /// This stateless mode remains an explicit selection rather than the
+    /// default or an `initialize`-negotiated revision.
     V2026_07_28,
 }
 

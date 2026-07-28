@@ -33,8 +33,11 @@ use super::patterns::parse_patterns;
 pub(crate) fn build_scenario(kind: &str, params: &Value) -> Result<Box<dyn Scenario>> {
     match kind {
         "sustained" => {
-            let concurrent = u32_field(params, "concurrent", 10)?;
-            let duration = parse_dur_field(params.get("duration"), Duration::from_secs(60))?;
+            let concurrent = positive_u32("concurrent", u32_field(params, "concurrent", 10)?)?;
+            let duration = positive_duration(
+                "duration",
+                parse_dur_field(params.get("duration"), Duration::from_secs(60))?,
+            )?;
             if has_pattern_config(params) {
                 let patterns = parse_patterns(params)?;
                 return Ok(Box::new(PatternScenario::sustained(
@@ -51,9 +54,11 @@ pub(crate) fn build_scenario(kind: &str, params: &Value) -> Result<Box<dyn Scena
             }))
         }
         "deadlock_probe" => {
-            let concurrent = u32_field(params, "concurrent", 20)?;
-            let hang_threshold =
-                parse_dur_field(params.get("hang_threshold"), Duration::from_secs(5))?;
+            let concurrent = positive_u32("concurrent", u32_field(params, "concurrent", 20)?)?;
+            let hang_threshold = positive_duration(
+                "hang_threshold",
+                parse_dur_field(params.get("hang_threshold"), Duration::from_secs(5))?,
+            )?;
             let grace_period =
                 parse_dur_field(params.get("grace_period"), Duration::from_secs(10))?;
             let tool = required_str(params, "tool")?;
@@ -67,11 +72,17 @@ pub(crate) fn build_scenario(kind: &str, params: &Value) -> Result<Box<dyn Scena
             }))
         }
         "cold_start" => {
-            let iterations = u32_field(params, "iterations", 5)?;
+            let iterations = positive_u32("iterations", u32_field(params, "iterations", 5)?)?;
             let warmup = params
                 .get("warmup")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
+            if warmup && iterations < 2 {
+                return Err(anyhow!(
+                    "scenario.iterations must be >= 2 when scenario.warmup = true; \
+                     the warm-up iteration is excluded from measured evidence"
+                ));
+            }
             let tool = required_str(params, "tool")?;
             let args = params.get("args").cloned().unwrap_or(json!({}));
             Ok(Box::new(ColdStart {
@@ -82,11 +93,19 @@ pub(crate) fn build_scenario(kind: &str, params: &Value) -> Result<Box<dyn Scena
             }))
         }
         "spike" => {
-            let baseline_concurrent = u32_field(params, "baseline_concurrent", 5)?;
-            let spike_concurrent = u32_field(params, "spike_concurrent", 50)?;
+            let baseline_concurrent = positive_u32(
+                "baseline_concurrent",
+                u32_field(params, "baseline_concurrent", 5)?,
+            )?;
+            let spike_concurrent = positive_u32(
+                "spike_concurrent",
+                u32_field(params, "spike_concurrent", 50)?,
+            )?;
             let warmup = parse_dur_field(params.get("warmup"), Duration::from_secs(30))?;
-            let spike_duration =
-                parse_dur_field(params.get("spike_duration"), Duration::from_secs(30))?;
+            let spike_duration = positive_duration(
+                "spike_duration",
+                parse_dur_field(params.get("spike_duration"), Duration::from_secs(30))?,
+            )?;
             let cooldown = parse_dur_field(params.get("cooldown"), Duration::from_secs(30))?;
             let tool = required_str(params, "tool")?;
             let args = params.get("args").cloned().unwrap_or(json!({}));
@@ -101,12 +120,25 @@ pub(crate) fn build_scenario(kind: &str, params: &Value) -> Result<Box<dyn Scena
             }))
         }
         "ramp" => {
-            let from_concurrent =
-                required_u32_alias(params, &["from_concurrent", "ramp_from", "from"])?;
-            let to_concurrent = required_u32_alias(params, &["to_concurrent", "ramp_to", "to"])?;
-            let step_duration =
-                required_dur_alias(params, &["step_duration", "step", "ramp_step"])?;
-            let step_increment = u32_field(params, "step_increment", 1)?;
+            let from_concurrent = positive_u32(
+                "from_concurrent",
+                required_u32_alias(params, &["from_concurrent", "ramp_from", "from"])?,
+            )?;
+            let to_concurrent = positive_u32(
+                "to_concurrent",
+                required_u32_alias(params, &["to_concurrent", "ramp_to", "to"])?,
+            )?;
+            if to_concurrent < from_concurrent {
+                return Err(anyhow!(
+                    "scenario.to_concurrent must be >= scenario.from_concurrent"
+                ));
+            }
+            let step_duration = positive_duration(
+                "step_duration",
+                required_dur_alias(params, &["step_duration", "step", "ramp_step"])?,
+            )?;
+            let step_increment =
+                positive_u32("step_increment", u32_field(params, "step_increment", 1)?)?;
             let tool = required_str(params, "tool")?;
             let args = params.get("args").cloned().unwrap_or(json!({}));
             let breaking_point = parse_breaking_point(params, step_duration)?;
@@ -122,17 +154,36 @@ pub(crate) fn build_scenario(kind: &str, params: &Value) -> Result<Box<dyn Scena
         }
         "soak" => {
             let defaults = Soak::default();
-            let concurrent = u32_field(params, "concurrent", defaults.concurrent)?;
-            let duration = parse_dur_field(params.get("duration"), defaults.duration)?;
+            let concurrent = positive_u32(
+                "concurrent",
+                u32_field(params, "concurrent", defaults.concurrent)?,
+            )?;
+            if concurrent != 1 {
+                return Err(anyhow!(
+                    "scenario.concurrent: soak currently supports exactly 1; \
+                     use sustained for pooled concurrency"
+                ));
+            }
+            let duration = positive_duration(
+                "duration",
+                parse_dur_field(params.get("duration"), defaults.duration)?,
+            )?;
             let tool = required_str(params, "tool")?;
             let args = params.get("args").cloned().unwrap_or(json!({}));
-            let sample_interval =
-                parse_dur_field(params.get("sample_interval"), defaults.sample_interval)?;
+            let sample_interval = positive_duration(
+                "sample_interval",
+                parse_dur_field(params.get("sample_interval"), defaults.sample_interval)?,
+            )?;
             let latency_drift_ms_per_sec = f64_field(
                 params,
                 "latency_drift_ms_per_sec",
                 defaults.latency_drift_ms_per_sec,
             )?;
+            if !latency_drift_ms_per_sec.is_finite() || latency_drift_ms_per_sec < 0.0 {
+                return Err(anyhow!(
+                    "scenario.latency_drift_ms_per_sec must be finite and >= 0"
+                ));
+            }
             Ok(Box::new(Soak {
                 concurrent,
                 duration,
@@ -144,6 +195,11 @@ pub(crate) fn build_scenario(kind: &str, params: &Value) -> Result<Box<dyn Scena
         }
         "race_check" => {
             let concurrent = u32_field(params, "concurrent", 10)?;
+            if concurrent < 2 {
+                return Err(anyhow!(
+                    "scenario.concurrent: race_check requires at least 2 synchronized calls"
+                ));
+            }
             let tool = required_str(params, "tool")?;
             let args = params.get("args").cloned().unwrap_or(json!({}));
             Ok(Box::new(RaceCheck {
@@ -153,7 +209,10 @@ pub(crate) fn build_scenario(kind: &str, params: &Value) -> Result<Box<dyn Scena
             }))
         }
         "fuzzer" => {
-            let iterations = u32_field(params, "iterations", Fuzzer::default().iterations)?;
+            let iterations = positive_u32(
+                "iterations",
+                u32_field(params, "iterations", Fuzzer::default().iterations)?,
+            )?;
             let seed = u64_field(params, "seed", Fuzzer::default().seed)?;
             let payloads = parse_fuzz_payloads(params)?;
             Ok(Box::new(Fuzzer {
@@ -163,15 +222,21 @@ pub(crate) fn build_scenario(kind: &str, params: &Value) -> Result<Box<dyn Scena
             }))
         }
         "pattern" => {
-            let concurrent = u32_field(params, "concurrent", 10)?;
-            let duration = parse_dur_field(params.get("duration"), Duration::from_secs(60))?;
+            let concurrent = positive_u32("concurrent", u32_field(params, "concurrent", 10)?)?;
+            let duration = positive_duration(
+                "duration",
+                parse_dur_field(params.get("duration"), Duration::from_secs(60))?,
+            )?;
             let patterns = parse_patterns(params)?;
             Ok(Box::new(PatternScenario::new(
                 concurrent, duration, patterns,
             )))
         }
         "version_matrix" => {
-            let calls_per_version = u32_field(params, "calls_per_version", 10)?;
+            let calls_per_version = positive_u32(
+                "calls_per_version",
+                u32_field(params, "calls_per_version", 10)?,
+            )?;
             let tool = required_str(params, "tool")?;
             let args = params.get("args").cloned().unwrap_or(json!({}));
             let versions = parse_versions(params)?;
@@ -183,6 +248,22 @@ pub(crate) fn build_scenario(kind: &str, params: &Value) -> Result<Box<dyn Scena
             }))
         }
         other => Err(anyhow!("unknown scenario kind: {other}")),
+    }
+}
+
+fn positive_u32(field: &str, value: u32) -> Result<u32> {
+    if value == 0 {
+        Err(anyhow!("scenario.{field} must be >= 1"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn positive_duration(field: &str, value: Duration) -> Result<Duration> {
+    if value.is_zero() {
+        Err(anyhow!("scenario.{field} must be > 0"))
+    } else {
+        Ok(value)
     }
 }
 
@@ -236,7 +317,7 @@ mod tests {
             ),
             (
                 "cold_start",
-                json!({"iterations": 1, "tool": "echo"}),
+                json!({"iterations": 2, "tool": "echo"}),
                 "cold_start",
             ),
             (
@@ -312,7 +393,7 @@ mod tests {
     fn cold_start_requires_tool() {
         // cold_start drives a real first call per fresh session, so `tool`
         // is required (same contract as deadlock_probe).
-        let err = match build_scenario("cold_start", &json!({"iterations": 1})) {
+        let err = match build_scenario("cold_start", &json!({"iterations": 2})) {
             Ok(_) => panic!("cold_start without tool must error"),
             Err(err) => err,
         };
@@ -341,5 +422,96 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("unknown fuzzer payload"));
+    }
+
+    #[test]
+    fn rejects_zero_or_impossible_scenario_bounds() {
+        let cases = [
+            (
+                "sustained",
+                json!({"concurrent": 0, "tool": "echo"}),
+                "concurrent",
+            ),
+            (
+                "sustained",
+                json!({"duration": "0s", "tool": "echo"}),
+                "duration",
+            ),
+            (
+                "deadlock_probe",
+                json!({"concurrent": 0, "tool": "echo"}),
+                "concurrent",
+            ),
+            (
+                "cold_start",
+                json!({"iterations": 0, "tool": "echo"}),
+                "iterations",
+            ),
+            (
+                "cold_start",
+                json!({"iterations": 1, "warmup": true, "tool": "echo"}),
+                ">= 2",
+            ),
+            (
+                "ramp",
+                json!({
+                    "from_concurrent": 2,
+                    "to_concurrent": 1,
+                    "step_duration": "1s",
+                    "tool": "echo"
+                }),
+                "to_concurrent",
+            ),
+            (
+                "soak",
+                json!({
+                    "concurrent": 1,
+                    "duration": "1s",
+                    "sample_interval": "0s",
+                    "tool": "echo"
+                }),
+                "sample_interval",
+            ),
+            (
+                "soak",
+                json!({
+                    "concurrent": 2,
+                    "duration": "1s",
+                    "sample_interval": "1s",
+                    "tool": "echo"
+                }),
+                "exactly 1",
+            ),
+            (
+                "race_check",
+                json!({"concurrent": 1, "tool": "echo"}),
+                "at least 2",
+            ),
+            (
+                "pattern",
+                json!({
+                    "duration": "0s",
+                    "patterns": [{"steps": [{"tool": "echo"}]}]
+                }),
+                "duration",
+            ),
+            ("fuzzer", json!({"iterations": 0}), "iterations"),
+            (
+                "version_matrix",
+                json!({"calls_per_version": 0, "tool": "echo"}),
+                "calls_per_version",
+            ),
+        ];
+
+        for (kind, params, expected) in cases {
+            let err = match build_scenario(kind, &params) {
+                Ok(_) => panic!("{kind} accepted invalid params {params}"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains(expected),
+                "{kind}: expected {expected:?} in {err:#}"
+            );
+        }
     }
 }

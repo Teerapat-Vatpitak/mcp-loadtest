@@ -15,8 +15,8 @@
 //! 2. One `tools/call` against `tool`, wrapped in [`hang_detect`] (same
 //!    classification as `deadlock_probe`) and recorded under the real tool
 //!    name.
-//! 3. Bounded shutdown of that session. On timeout the child is still reaped
-//!    via `kill_on_drop`.
+//! 3. Bounded shutdown of that session. Any teardown error or outer timeout
+//!    becomes a typed report-gating lifecycle failure.
 //!
 //! With `warmup = true` (default) iteration 0 **still runs** — paying the
 //! one-time JIT / import / page-cache costs — but its samples are excluded
@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::scenario::{RunContext, Scenario, ScenarioOutcome, classify_error, is_terminal_error};
+use crate::scenario::{
+    RunContext, Scenario, ScenarioOutcome, classify_error, is_terminal_error, teardown,
+};
 use mcp_loadtest_core::metrics::CallOutcome;
 use mcp_loadtest_protocol::Session;
 use mcp_loadtest_protocol::hang_detector::{HangOutcome, hang_detect};
@@ -37,11 +39,6 @@ use mcp_loadtest_protocol::hang_detector::{HangOutcome, hang_detect};
 /// duration is recorded. The `:` infix keeps it from colliding with any real
 /// MCP tool name (tool names are `[a-zA-Z0-9_-]` in practice).
 pub const HANDSHAKE_METRIC: &str = "cold_start:handshake";
-
-/// Budget for the per-iteration session shutdown. Bounded so one wedged
-/// server can't stall the remaining iterations; on timeout the `Session` is
-/// dropped and the child is reaped via `kill_on_drop`.
-const ITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Cold-start scenario: respawn a fresh server per iteration and measure the
 /// handshake plus the first tool call. See module docs for the algorithm.
@@ -57,6 +54,15 @@ pub struct ColdStart {
     pub args: Value,
 }
 
+impl ColdStart {
+    fn validation_error(&self) -> Option<&'static str> {
+        (self.warmup && self.iterations < 2).then_some(
+            "cold_start: invalid configuration — iterations must be >= 2 when warmup=true; \
+             the warm-up iteration is excluded from measured evidence",
+        )
+    }
+}
+
 #[async_trait]
 impl Scenario for ColdStart {
     async fn drive(&self, _session: &mut Session, ctx: &RunContext) -> ScenarioOutcome {
@@ -66,6 +72,16 @@ impl Scenario for ColdStart {
         // spawns its own fresh process per iteration via the factory;
         // `Run::execute` shuts the original session down as usual afterwards.
         let mut outcome = ScenarioOutcome::default();
+
+        // A warm-up-only run has no measured evidence: iteration 0 is
+        // deliberately excluded from the recorder. Reject it here as well as
+        // in the CLI builder so direct library construction cannot turn one
+        // discarded success into a false-green Report.
+        if let Some(message) = self.validation_error() {
+            outcome.error_count = 1;
+            outcome.notes.push(message.to_owned());
+            return outcome;
+        }
 
         let Some(factory) = ctx.session_factory.clone() else {
             // Direct-library callers that built a bare RunContext get a
@@ -94,8 +110,8 @@ impl Scenario for ColdStart {
 
             // Phase 1: spawn + initialize — the cold-start measurement.
             // Raced against cancellation so a hung handshake can't pin the
-            // run past shutdown (dropping the spawn future kills any
-            // already-spawned child via kill_on_drop).
+            // run past shutdown (dropping the spawn future requests
+            // termination of any already-spawned child via kill_on_drop).
             let spawn_start = Instant::now();
             let spawned = tokio::select! {
                 biased;
@@ -139,18 +155,36 @@ impl Scenario for ColdStart {
             let hang_outcome = hang_detect(call_fut, ctx.hang_threshold, ctx.grace_period).await;
             let mut terminal = false;
             match hang_outcome {
-                HangOutcome::Ok { duration, .. } => {
-                    outcome.successful_calls += 1;
+                HangOutcome::Ok { result, duration } => {
+                    let logical_error = super::is_logical_tool_error(&result);
+                    if logical_error {
+                        outcome.error_count += 1;
+                    } else {
+                        outcome.successful_calls += 1;
+                    }
                     if !discard {
-                        ctx.metrics
-                            .record_tool(&self.tool, duration, CallOutcome::Success);
+                        let kind = if logical_error {
+                            CallOutcome::ServerError
+                        } else {
+                            CallOutcome::Success
+                        };
+                        ctx.metrics.record_tool(&self.tool, duration, kind);
                     }
                 }
-                HangOutcome::Slow { duration, .. } => {
-                    outcome.hang_count += 1;
+                HangOutcome::Slow { result, duration } => {
+                    let logical_error = super::is_logical_tool_error(&result);
+                    if logical_error {
+                        outcome.error_count += 1;
+                    } else {
+                        outcome.hang_count += 1;
+                    }
                     if !discard {
-                        ctx.metrics
-                            .record_tool(&self.tool, duration, CallOutcome::Hang);
+                        let kind = if logical_error {
+                            CallOutcome::ServerError
+                        } else {
+                            CallOutcome::Hang
+                        };
+                        ctx.metrics.record_tool(&self.tool, duration, kind);
                     }
                     outcome.notes.push(format!(
                         "slow first call: tool={} iter={iter} took={}ms",
@@ -200,21 +234,10 @@ impl Scenario for ColdStart {
             }
 
             // Phase 3: bounded shutdown so child processes never pile up
-            // across iterations. On timeout the Session (and transport) is
-            // dropped — the child is kill_on_drop, so it is reaped anyway.
-            match tokio::time::timeout(ITER_SHUTDOWN_TIMEOUT, session.shutdown()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!(iter, error = %e, "cold_start: per-iteration shutdown errored");
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        iter,
-                        "cold_start: per-iteration shutdown exceeded {ITER_SHUTDOWN_TIMEOUT:?}; \
-                         child reaped via kill_on_drop"
-                    );
-                }
-            }
+            // across iterations. Lifecycle uncertainty is a typed failure,
+            // not a warning-only side channel.
+            teardown::shutdown_session(session, &mut outcome, format!("cold_start iter={iter}"))
+                .await;
 
             if terminal {
                 outcome
@@ -237,12 +260,12 @@ impl Scenario for ColdStart {
                     "type": "integer",
                     "minimum": 1,
                     "default": 5,
-                    "description": "How many cold-start iterations to perform."
+                    "description": "How many cold-start iterations to perform. Must be at least 2 when warmup=true because iteration 0 is excluded from measured evidence."
                 },
                 "warmup": {
                     "type": "boolean",
                     "default": true,
-                    "description": "Run iteration 0 but discard its samples as JIT/import warm-up."
+                    "description": "Run iteration 0 but discard its samples as JIT/import warm-up. Requires iterations >= 2."
                 },
                 "tool": {
                     "type": "string",
@@ -253,7 +276,19 @@ impl Scenario for ColdStart {
                     "description": "Arguments JSON object passed to the tool on every call."
                 }
             },
-            "required": ["tool"]
+            "required": ["tool"],
+            "allOf": [{
+                "if": {
+                    "properties": {
+                        "warmup": { "const": true }
+                    }
+                },
+                "then": {
+                    "properties": {
+                        "iterations": { "minimum": 2 }
+                    }
+                }
+            }]
         })
     }
 
@@ -297,5 +332,35 @@ mod tests {
     fn handshake_metric_name_is_pinned() {
         // Reports and downstream tooling key on this exact string.
         assert_eq!(HANDSHAKE_METRIC, "cold_start:handshake");
+    }
+
+    #[test]
+    fn schema_rejects_warmup_only_evidence() {
+        let schema = scenario().config_schema();
+        assert_eq!(
+            schema["allOf"][0]["then"]["properties"]["iterations"]["minimum"],
+            2
+        );
+    }
+
+    #[test]
+    fn direct_construction_rejects_warmup_only_evidence() {
+        let invalid = ColdStart {
+            iterations: 1,
+            warmup: true,
+            tool: "echo".to_owned(),
+            args: json!({}),
+        };
+        assert!(
+            invalid
+                .validation_error()
+                .is_some_and(|message| message.contains("measured evidence"))
+        );
+
+        let measured_single = ColdStart {
+            warmup: false,
+            ..invalid
+        };
+        assert_eq!(measured_single.validation_error(), None);
     }
 }

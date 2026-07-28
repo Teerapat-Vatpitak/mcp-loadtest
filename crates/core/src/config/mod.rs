@@ -18,6 +18,7 @@ mod validate;
 pub use example::example_config;
 pub use load::*;
 pub use tool_slo::ToolSlo;
+pub use validate::{is_managed_remote_header, sanitize_remote_endpoint, validate_remote_endpoint};
 
 /// Top-level config.
 ///
@@ -66,9 +67,10 @@ pub struct ValidationConfig {
 /// Transport-specific fields:
 /// - `transport = "stdio"` (default) → `command` required; `args`, `env`,
 ///   `working_dir` apply.
-/// - `transport = "http"` or `"sse"` → `url` required; `command`/`args`/`env`
-///   ignored.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// - `transport = "http"`, `"sse"`, or `"ws"` → `url` required;
+///   `command`/`args`/`env` ignored.
+#[derive(Debug, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ServerConfig {
     /// Stdio: command to spawn (e.g., `"python"`). Required when `transport = "stdio"`.
@@ -83,13 +85,14 @@ pub struct ServerConfig {
     /// Stdio: CWD for the child. Defaults to the parent's CWD.
     #[serde(default)]
     pub working_dir: Option<PathBuf>,
-    /// HTTP / SSE: endpoint URL. Required when `transport = "http"` or `"sse"`.
+    /// HTTP / SSE / WS: endpoint URL. Required for every remote transport.
     #[serde(default)]
     pub url: Option<String>,
     /// Transport: `"stdio"` (M1+), `"http"` / `"sse"` (M4).
     #[serde(default = "default_transport")]
     pub transport: String,
-    /// Time budget for `initialize` round-trip.
+    /// Run startup budget covering transport connect, initialize/discover,
+    /// and the required initial tools/list discovery.
     #[serde(default = "default_startup_timeout", with = "humantime_serde")]
     pub startup_timeout: Duration,
     /// HTTP / SSE / WS only: exact-match outbound host allowlist (SSRF guard,
@@ -107,6 +110,77 @@ pub struct ServerConfig {
     /// version-matrix runs. Unsupported values are rejected at config load.
     #[serde(default)]
     pub protocol_version: Option<String>,
+    /// HTTP / SSE / WS only: outbound header name to environment-variable
+    /// name. The environment variable contains the complete header value
+    /// (for example `Authorization = "MCP_AUTHORIZATION"`, where
+    /// `MCP_AUTHORIZATION` contains `Bearer ...`).
+    ///
+    /// Values are resolved only when a remote transport connects and are
+    /// never included in config debug output or error messages. Literal
+    /// header values are deliberately unsupported so secrets do not have to
+    /// live in checked-in TOML.
+    #[serde(default)]
+    pub headers_from_env: BTreeMap<String, String>,
+}
+
+/// Deserialization mirror for [`ServerConfig`].
+///
+/// Unknown values are consumed as [`serde::de::IgnoredAny`] and rejected only
+/// after the table has been read. `toml` otherwise attaches the complete
+/// offending source line to an `unknown_field` error, which can echo a
+/// misspelled literal credential. This keeps the same deny-unknown-fields
+/// contract as the public schema while ensuring diagnostics contain only the
+/// unknown key name.
+#[derive(Deserialize)]
+struct ServerConfigWire {
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    working_dir: Option<PathBuf>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default = "default_transport")]
+    transport: String,
+    #[serde(default = "default_startup_timeout", with = "humantime_serde")]
+    startup_timeout: Duration,
+    #[serde(default)]
+    allowed_hosts: Vec<String>,
+    #[serde(default)]
+    protocol_version: Option<String>,
+    #[serde(default)]
+    headers_from_env: BTreeMap<String, String>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, serde::de::IgnoredAny>,
+}
+
+impl<'de> Deserialize<'de> for ServerConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ServerConfigWire::deserialize(deserializer)?;
+        if let Some(name) = wire.unknown.keys().next() {
+            return Err(<D::Error as serde::de::Error>::custom(format!(
+                "unknown field `{name}` in server configuration"
+            )));
+        }
+        Ok(Self {
+            command: wire.command,
+            args: wire.args,
+            env: wire.env,
+            working_dir: wire.working_dir,
+            url: wire.url,
+            transport: wire.transport,
+            startup_timeout: wire.startup_timeout,
+            allowed_hosts: wire.allowed_hosts,
+            protocol_version: wire.protocol_version,
+            headers_from_env: wire.headers_from_env,
+        })
+    }
 }
 
 fn default_transport() -> String {
@@ -133,6 +207,7 @@ impl ServerConfig {
             startup_timeout: default_startup_timeout(),
             allowed_hosts: Vec::new(),
             protocol_version: None,
+            headers_from_env: BTreeMap::new(),
         }
     }
 
@@ -196,6 +271,11 @@ pub struct ThresholdsConfig {
     /// Per-call hang threshold (also used by `hang_detect`).
     pub hang_timeout: Option<Duration>,
     /// Max RSS growth (MB) tolerated during the run.
+    ///
+    /// For stdio scenarios that create factory-owned child processes (for
+    /// example pooled concurrency or cold start), this gate currently fails
+    /// closed because the sampler observes only the initial child. It never
+    /// treats that idle process as representative of the whole workload.
     #[serde(default)]
     pub memory_growth_mb: Option<f64>,
     /// Max RSS growth *rate* (MB per second) tolerated during the run.
@@ -211,8 +291,11 @@ pub struct ThresholdsConfig {
     ///
     /// Needs enough data to fit a line — at least 3 process samples
     /// spanning a non-zero time window (i.e. a run lasting a few sample
-    /// intervals, 500ms each by default). Shorter series skip the check
-    /// with a warning rather than guessing.
+    /// intervals, 500ms each by default). When this threshold is configured,
+    /// insufficient or non-finite evidence is a threshold violation rather
+    /// than a skipped check, so missing observability cannot produce PASS.
+    /// The same fail-closed rule applies when stdio factory sessions put
+    /// workload processes outside the sampler's single-PID scope.
     #[serde(default)]
     pub rss_leak_mb_per_sec: Option<f64>,
     /// Per-tool latency SLOs. Each entry maps a tool name to a p99 latency

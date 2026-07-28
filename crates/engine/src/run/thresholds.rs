@@ -20,6 +20,7 @@ pub(super) fn evaluate_thresholds(config: &Config, report: &Report) -> Vec<Thres
             ThresholdKind::P50Latency,
             p50,
             m.latency.p50,
+            m.latency.count,
             &mut violations,
         );
     }
@@ -28,6 +29,7 @@ pub(super) fn evaluate_thresholds(config: &Config, report: &Report) -> Vec<Thres
             ThresholdKind::P95Latency,
             p95,
             m.latency.p95,
+            m.latency.count,
             &mut violations,
         );
     }
@@ -36,6 +38,7 @@ pub(super) fn evaluate_thresholds(config: &Config, report: &Report) -> Vec<Thres
             ThresholdKind::P99Latency,
             p99,
             m.latency.p99,
+            m.latency.count,
             &mut violations,
         );
     }
@@ -44,6 +47,7 @@ pub(super) fn evaluate_thresholds(config: &Config, report: &Report) -> Vec<Thres
             ThresholdKind::P999Latency,
             p999,
             m.latency.p999,
+            m.latency.count,
             &mut violations,
         );
     }
@@ -51,20 +55,24 @@ pub(super) fn evaluate_thresholds(config: &Config, report: &Report) -> Vec<Thres
     if let Some(max_rate) = t.error_rate {
         let total = m.throughput.total_requests;
         let success = m.throughput.successful_requests;
-        // total > success because error_count == total - successful, but be
-        // paranoid about underflow.
-        let errors = total.saturating_sub(success);
-        let actual = if total == 0 {
-            0.0
-        } else {
-            errors as f64 / total as f64
-        };
-        if actual > max_rate {
+        if total == 0 {
             violations.push(ThresholdViolation {
                 kind: ThresholdKind::ErrorRate,
                 expected: format!("<= {max_rate}"),
-                actual: format!("{actual:.4}"),
+                actual: "unavailable: no recorder request outcomes".to_owned(),
             });
+        } else {
+            // total > success because error_count == total - successful, but
+            // remain defensive about underflow.
+            let errors = total.saturating_sub(success);
+            let actual = errors as f64 / total as f64;
+            if actual > max_rate {
+                violations.push(ThresholdViolation {
+                    kind: ThresholdKind::ErrorRate,
+                    expected: format!("<= {max_rate}"),
+                    actual: format!("{actual:.4}"),
+                });
+            }
         }
     }
 
@@ -79,22 +87,40 @@ pub(super) fn evaluate_thresholds(config: &Config, report: &Report) -> Vec<Thres
     if let Some(max_growth) = t.memory_growth_mb {
         let baseline = report.process.baseline_rss_mb;
         let peak = report.process.peak_rss_mb;
-        // ProcessSampler returns `f64` and pathological tear-down (process
-        // already exited, sysinfo returning NaN on Windows) can yield
-        // NaN/Inf. Skip the threshold check in that case rather than
-        // pushing a meaningless violation — log once so it's diagnosable.
-        if !peak.is_finite() || !baseline.is_finite() {
-            tracing::warn!(
-                peak = peak,
-                baseline = baseline,
-                "memory_growth threshold: non-finite RSS sample; skipping check"
+        let expected =
+            format!("<= {max_growth} MB (peak - baseline; requires finite process RSS samples)");
+        let non_finite_sample = report
+            .process
+            .samples
+            .iter()
+            .position(|sample| !sample.rss_mb.is_finite());
+        if report.process.samples.is_empty() {
+            push_unavailable_process_violation(
+                expected,
+                "unavailable: no process RSS samples".to_owned(),
+                &mut violations,
+            );
+        } else if !peak.is_finite() || !baseline.is_finite() || non_finite_sample.is_some() {
+            let detail = if !baseline.is_finite() {
+                format!("baseline RSS is {baseline}")
+            } else if !peak.is_finite() {
+                format!("peak RSS is {peak}")
+            } else if let Some(index) = non_finite_sample {
+                format!("RSS sample {index} is non-finite")
+            } else {
+                "RSS evidence is unavailable".to_owned()
+            };
+            push_unavailable_process_violation(
+                expected,
+                format!("unavailable: non-finite RSS evidence ({detail})"),
+                &mut violations,
             );
         } else {
             let observed_growth = (peak - baseline).max(0.0);
             if observed_growth > max_growth {
                 violations.push(ThresholdViolation {
                     kind: ThresholdKind::MemoryGrowthMb,
-                    expected: format!("<= {max_growth} MB (peak - baseline)"),
+                    expected,
                     actual: format!("{observed_growth:.2} MB"),
                 });
             }
@@ -120,8 +146,8 @@ pub(super) fn evaluate_thresholds(config: &Config, report: &Report) -> Vec<Thres
 /// threshold is evaluated. Two points always fit a line *exactly*, so a
 /// single tick of sampling jitter would read as a "leak"; three is the
 /// smallest series where the regression has a degree of freedom left over
-/// to average noise out. Shorter series (or ones spanning zero time) skip
-/// the check with a `tracing::warn` instead of guessing.
+/// to average noise out. A configured threshold fails closed when fewer
+/// samples are available (or when they cannot produce a finite slope).
 const MIN_RSS_SLOPE_SAMPLES: usize = 3;
 
 /// Evaluate the `rss_leak_mb_per_sec` threshold: fit a least-squares line
@@ -143,48 +169,113 @@ fn check_rss_slope(
     samples: &[ProcessSample],
     violations: &mut Vec<ThresholdViolation>,
 ) {
-    if samples.len() < MIN_RSS_SLOPE_SAMPLES {
-        tracing::warn!(
-            samples = samples.len(),
-            min = MIN_RSS_SLOPE_SAMPLES,
-            "rss_leak threshold: too few process samples for a slope fit; skipping check"
+    let expected = format!(
+        "<= {max_slope} MB/s (least-squares RSS slope; requires at least \
+         {MIN_RSS_SLOPE_SAMPLES} finite samples with a non-zero time span)"
+    );
+    if samples.is_empty() {
+        push_unavailable_process_violation(
+            expected,
+            "unavailable: no process RSS samples".to_owned(),
+            violations,
         );
         return;
     }
-    // Mirror the non-finite-RSS handling on `memory_growth_mb`: sysinfo
-    // tear-down races can yield NaN/Inf samples, and one NaN anywhere in
-    // the series makes the fitted slope NaN — which would silently PASS
-    // the `>` comparison below. Skip loudly instead.
-    if samples
+    if let Some((index, sample)) = samples
         .iter()
-        .any(|s| !s.at_secs.is_finite() || !s.rss_mb.is_finite())
+        .enumerate()
+        .find(|(_, sample)| !sample.at_secs.is_finite() || !sample.rss_mb.is_finite())
     {
-        tracing::warn!("rss_leak threshold: non-finite RSS sample; skipping check");
+        let fields = if !sample.at_secs.is_finite() && !sample.rss_mb.is_finite() {
+            "timestamp and RSS"
+        } else if !sample.at_secs.is_finite() {
+            "timestamp"
+        } else {
+            "RSS"
+        };
+        push_unavailable_process_violation(
+            expected,
+            format!("unavailable: sample {index} has non-finite {fields}"),
+            violations,
+        );
+        return;
+    }
+    if samples.len() < MIN_RSS_SLOPE_SAMPLES {
+        push_unavailable_process_violation(
+            expected,
+            format!(
+                "unavailable: {} process RSS sample(s); need at least \
+                 {MIN_RSS_SLOPE_SAMPLES}",
+                samples.len()
+            ),
+            violations,
+        );
         return;
     }
     let series: Vec<(f64, f64)> = samples.iter().map(|s| (s.at_secs, s.rss_mb)).collect();
     // `detect_leak` returns None when every timestamp coincides (zero time
     // span) — a slope can't be fitted to a vertical line.
     let Some(slope) = crate::scenario::soak::detect_leak(&series) else {
-        tracing::warn!("rss_leak threshold: samples span zero time; skipping check");
+        push_unavailable_process_violation(
+            expected,
+            "unavailable: process RSS samples have no usable time span".to_owned(),
+            violations,
+        );
         return;
     };
+    if !slope.is_finite() {
+        push_unavailable_process_violation(
+            expected,
+            format!("unavailable: fitted RSS slope is non-finite ({slope})"),
+            violations,
+        );
+        return;
+    }
     if slope > max_slope {
         violations.push(ThresholdViolation {
             kind: ThresholdKind::MemoryGrowthMb,
-            expected: format!("<= {max_slope} MB/s (least-squares RSS slope)"),
+            expected,
             actual: format!("{slope:.4} MB/s"),
         });
     }
+}
+
+/// Record that a configured process threshold could not be evaluated.
+///
+/// Unavailable evidence is itself a typed threshold violation: silently
+/// omitting the check would turn remote/no-PID runs, short runs, and invalid
+/// sampler output into false-green reports.
+fn push_unavailable_process_violation(
+    expected: String,
+    actual: String,
+    violations: &mut Vec<ThresholdViolation>,
+) {
+    tracing::warn!(
+        expected = %expected,
+        actual = %actual,
+        "configured process threshold could not be evaluated; failing closed"
+    );
+    violations.push(ThresholdViolation {
+        kind: ThresholdKind::MemoryGrowthMb,
+        expected,
+        actual,
+    });
 }
 
 fn check_latency(
     kind: ThresholdKind,
     budget: Duration,
     actual: Duration,
+    sample_count: u64,
     violations: &mut Vec<ThresholdViolation>,
 ) {
-    if actual > budget {
+    if sample_count == 0 {
+        violations.push(ThresholdViolation {
+            kind,
+            expected: format!("<= {}", format_duration_ms(budget)),
+            actual: "unavailable: no recorder latency samples".to_owned(),
+        });
+    } else if actual > budget {
         violations.push(ThresholdViolation {
             kind,
             expected: format!("<= {}", format_duration_ms(budget)),
@@ -195,30 +286,46 @@ fn check_latency(
 
 /// Evaluate `config.thresholds.tool_slos` against the per-tool metrics
 /// snapshot. Returns one [`ThresholdViolation`] for each tool whose p99
-/// exceeded the configured budget. Tools that never recorded any latency
-/// samples (e.g. registered but unexercised) are silently skipped — they
-/// already show up in the coverage report's `unexercised` list. M7
-/// differentiator.
+/// exceeded the configured budget or whose required latency evidence is
+/// unavailable. Coverage is informative, but it is not itself a pass gate;
+/// silently skipping an unexercised configured SLO would be a false green.
 pub(super) fn evaluate_tool_slos(
     config: &Config,
     per_tool: &std::collections::BTreeMap<String, mcp_loadtest_core::metrics::ScenarioMetrics>,
 ) -> Vec<ThresholdViolation> {
     let mut violations = Vec::new();
     for slo in &config.thresholds.tool_slos {
+        let expected = format!(
+            "<= {} for tool `{}`",
+            format_duration_ms(slo.p99_latency),
+            slo.tool
+        );
         let Some(metrics) = per_tool.get(&slo.tool) else {
+            violations.push(ThresholdViolation {
+                kind: ThresholdKind::P99Latency,
+                expected,
+                actual: format!(
+                    "unavailable: no recorder metrics for configured tool `{}`",
+                    slo.tool
+                ),
+            });
             continue;
         };
         if metrics.latency.count == 0 {
+            violations.push(ThresholdViolation {
+                kind: ThresholdKind::P99Latency,
+                expected,
+                actual: format!(
+                    "unavailable: no latency samples for configured tool `{}`",
+                    slo.tool
+                ),
+            });
             continue;
         }
         if metrics.latency.p99 > slo.p99_latency {
             violations.push(ThresholdViolation {
                 kind: ThresholdKind::P99Latency,
-                expected: format!(
-                    "<= {} for tool `{}`",
-                    format_duration_ms(slo.p99_latency),
-                    slo.tool
-                ),
+                expected,
                 actual: format!(
                     "{} for tool `{}`",
                     format_duration_ms(metrics.latency.p99),
@@ -243,7 +350,7 @@ mod tests {
 
     use super::*;
     use crate::scenario::ScenarioOutcome;
-    use mcp_loadtest_core::config::{ScenarioConfig, ServerConfig, ThresholdsConfig};
+    use mcp_loadtest_core::config::{ScenarioConfig, ServerConfig, ThresholdsConfig, ToolSlo};
     use mcp_loadtest_core::metrics::{
         LatencyStats, OutcomeCounts, ScenarioMetrics, ThroughputStats,
     };
@@ -317,6 +424,7 @@ mod tests {
         let metrics = ScenarioMetrics {
             latency: LatencyStats {
                 p99: Duration::from_millis(500),
+                count: 1,
                 ..Default::default()
             },
             ..empty_metrics()
@@ -337,6 +445,7 @@ mod tests {
         let metrics = ScenarioMetrics {
             latency: LatencyStats {
                 p99: Duration::from_millis(100),
+                count: 1,
                 ..Default::default()
             },
             ..empty_metrics()
@@ -374,15 +483,16 @@ mod tests {
             t.memory_growth_mb = Some(50.0);
         }));
 
-        let process = ProcessStats {
-            peak_rss_mb: 100.0,
-            ..Default::default()
-        };
+        let mut process = process_with_rss_samples(&[(0.5, 20.0), (1.0, 100.0)]);
+        process.baseline_rss_mb = 20.0;
+        process.peak_rss_mb = 100.0;
+        process.final_rss_mb = 100.0;
         let report = make_report(empty_metrics(), process);
 
         let v = evaluate_thresholds(&cfg, &report);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, ThresholdKind::MemoryGrowthMb);
+        assert_eq!(v[0].actual, "80.00 MB");
     }
 
     #[test]
@@ -393,12 +503,10 @@ mod tests {
         let cfg = make_config(thresholds_with(|t| {
             t.memory_growth_mb = Some(50.0);
         }));
-        let process = ProcessStats {
-            baseline_rss_mb: 20.0,
-            peak_rss_mb: 120.0,
-            final_rss_mb: 120.0, // leaked monotonically — final == peak
-            ..Default::default()
-        };
+        let mut process = process_with_rss_samples(&[(0.5, 20.0), (1.0, 70.0), (1.5, 120.0)]);
+        process.baseline_rss_mb = 20.0;
+        process.peak_rss_mb = 120.0;
+        process.final_rss_mb = 120.0; // leaked monotonically — final == peak
         let report = make_report(empty_metrics(), process);
 
         let v = evaluate_thresholds(&cfg, &report);
@@ -418,12 +526,10 @@ mod tests {
         let cfg = make_config(thresholds_with(|t| {
             t.memory_growth_mb = Some(50.0);
         }));
-        let process = ProcessStats {
-            baseline_rss_mb: 200.0,
-            peak_rss_mb: 205.0,
-            final_rss_mb: 201.0,
-            ..Default::default()
-        };
+        let mut process = process_with_rss_samples(&[(0.5, 200.0), (1.0, 205.0), (1.5, 201.0)]);
+        process.baseline_rss_mb = 200.0;
+        process.peak_rss_mb = 205.0;
+        process.final_rss_mb = 201.0;
         let report = make_report(empty_metrics(), process);
 
         let v = evaluate_thresholds(&cfg, &report);
@@ -434,14 +540,112 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_thresholds_zero_total_requests_zero_error_rate() {
+    fn configured_process_thresholds_fail_closed_without_samples() {
+        let cfg = make_config(thresholds_with(|t| {
+            t.memory_growth_mb = Some(50.0);
+            t.rss_leak_mb_per_sec = Some(0.5);
+        }));
+        let mut report = make_report(empty_metrics(), ProcessStats::default());
+        report.scenario_outcome.total_calls = 1;
+        report.scenario_outcome.successful_calls = 1;
+
+        let v = evaluate_thresholds(&cfg, &report);
+        assert_eq!(
+            v.len(),
+            2,
+            "each configured process threshold must fail closed independently: {v:?}"
+        );
+        assert!(v.iter().all(|x| x.kind == ThresholdKind::MemoryGrowthMb));
+        assert!(
+            v.iter().any(|x| x.expected.contains("peak - baseline")),
+            "absolute-growth violation must remain identifiable: {v:?}"
+        );
+        assert!(
+            v.iter()
+                .any(|x| x.expected.contains("least-squares RSS slope")),
+            "slope violation must remain identifiable: {v:?}"
+        );
+        assert!(
+            v.iter()
+                .all(|x| x.actual == "unavailable: no process RSS samples"),
+            "missing evidence must be explicit: {v:?}"
+        );
+        report.threshold_violations = v;
+        assert!(
+            !report.passed(),
+            "typed unavailable-evidence violations must gate the report"
+        );
+    }
+
+    #[test]
+    fn memory_growth_non_finite_evidence_fails_closed() {
+        let cfg = make_config(thresholds_with(|t| {
+            t.memory_growth_mb = Some(50.0);
+        }));
+        let mut process = process_with_rss_samples(&[(0.5, 20.0), (1.0, 30.0)]);
+        process.baseline_rss_mb = f64::NAN;
+        process.peak_rss_mb = 30.0;
+        let report = make_report(empty_metrics(), process);
+
+        let v = evaluate_thresholds(&cfg, &report);
+        assert_eq!(v.len(), 1, "non-finite aggregate must fail closed: {v:?}");
+        assert_eq!(v[0].kind, ThresholdKind::MemoryGrowthMb);
+        assert!(
+            v[0].actual.contains("non-finite RSS evidence"),
+            "actual must explain why measurement is unavailable: {v:?}"
+        );
+    }
+
+    #[test]
+    fn configured_error_rate_without_request_evidence_fails_closed() {
         let cfg = make_config(thresholds_with(|t| {
             t.error_rate = Some(0.01);
         }));
 
         let report = make_report(empty_metrics(), ProcessStats::default());
         let v = evaluate_thresholds(&cfg, &report);
-        assert!(v.is_empty());
+        assert_eq!(v.len(), 1, "missing request evidence must gate: {v:?}");
+        assert_eq!(v[0].kind, ThresholdKind::ErrorRate);
+        assert!(v[0].actual.contains("no recorder request outcomes"));
+    }
+
+    #[test]
+    fn configured_latency_budgets_without_samples_each_fail_closed() {
+        let cfg = make_config(thresholds_with(|t| {
+            t.p50_latency = Some(Duration::from_millis(10));
+            t.p95_latency = Some(Duration::from_millis(20));
+            t.p99_latency = Some(Duration::from_millis(30));
+            t.p999_latency = Some(Duration::from_millis(40));
+        }));
+        let report = make_report(empty_metrics(), ProcessStats::default());
+
+        let v = evaluate_thresholds(&cfg, &report);
+        assert_eq!(v.len(), 4, "every configured percentile must gate: {v:?}");
+        assert!(
+            v.iter()
+                .all(|violation| violation.actual.contains("no recorder latency samples")),
+            "missing-evidence diagnostics must be explicit: {v:?}"
+        );
+    }
+
+    #[test]
+    fn configured_tool_slo_requires_tool_metrics_and_latency_samples() {
+        let cfg = make_config(thresholds_with(|t| {
+            t.tool_slos.push(ToolSlo {
+                tool: "required_tool".to_owned(),
+                p99_latency: Duration::from_millis(50),
+            });
+        }));
+
+        let missing = evaluate_tool_slos(&cfg, &std::collections::BTreeMap::new());
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].actual.contains("no recorder metrics"));
+
+        let mut zero_sample = std::collections::BTreeMap::new();
+        zero_sample.insert("required_tool".to_owned(), empty_metrics());
+        let zero_sample = evaluate_tool_slos(&cfg, &zero_sample);
+        assert_eq!(zero_sample.len(), 1);
+        assert!(zero_sample[0].actual.contains("no latency samples"));
     }
 
     /// Build a `ProcessStats` whose `samples` carry the given
@@ -508,9 +712,9 @@ mod tests {
     }
 
     #[test]
-    fn rss_leak_two_samples_skips_check() {
+    fn rss_leak_two_samples_fail_closed() {
         // Two points always fit a line exactly — even a wild apparent
-        // slope must be skipped below MIN_RSS_SLOPE_SAMPLES.
+        // slope is insufficient evidence below MIN_RSS_SLOPE_SAMPLES.
         let cfg = make_config(thresholds_with(|t| {
             t.rss_leak_mb_per_sec = Some(0.5);
         }));
@@ -518,9 +722,15 @@ mod tests {
         let report = make_report(empty_metrics(), process);
 
         let v = evaluate_thresholds(&cfg, &report);
+        assert_eq!(
+            v.len(),
+            1,
+            "a configured gate must fail closed on a 2-sample series: {v:?}"
+        );
         assert!(
-            v.is_empty(),
-            "a 2-sample series must skip the slope check, not trip it: {v:?}"
+            v[0].actual
+                .contains("2 process RSS sample(s); need at least 3"),
+            "actual must explain the insufficient evidence: {v:?}"
         );
     }
 
@@ -537,9 +747,9 @@ mod tests {
     }
 
     #[test]
-    fn rss_leak_zero_time_span_skips_check() {
+    fn rss_leak_zero_time_span_fails_closed() {
         // Three samples with identical timestamps — detect_leak returns
-        // None (degenerate t); must skip, not panic or trip.
+        // None (degenerate t); the configured gate must fail closed.
         let cfg = make_config(thresholds_with(|t| {
             t.rss_leak_mb_per_sec = Some(0.5);
         }));
@@ -547,13 +757,17 @@ mod tests {
         let report = make_report(empty_metrics(), process);
 
         let v = evaluate_thresholds(&cfg, &report);
-        assert!(v.is_empty(), "zero time span must skip the check: {v:?}");
+        assert_eq!(v.len(), 1, "zero time span must fail closed: {v:?}");
+        assert!(
+            v[0].actual.contains("no usable time span"),
+            "actual must explain the degenerate series: {v:?}"
+        );
     }
 
     #[test]
-    fn rss_leak_non_finite_sample_skips_check() {
+    fn rss_leak_non_finite_sample_fails_closed() {
         // One NaN sample poisons the fit (slope would be NaN, silently
-        // passing `>`); the check must skip loudly instead.
+        // passing `>`); the configured gate must fail closed instead.
         let cfg = make_config(thresholds_with(|t| {
             t.rss_leak_mb_per_sec = Some(0.5);
         }));
@@ -562,7 +776,31 @@ mod tests {
         let report = make_report(empty_metrics(), process);
 
         let v = evaluate_thresholds(&cfg, &report);
-        assert!(v.is_empty(), "non-finite RSS must skip the check: {v:?}");
+        assert_eq!(v.len(), 1, "non-finite RSS must fail closed: {v:?}");
+        assert!(
+            v[0].actual.contains("sample 1 has non-finite RSS"),
+            "actual must identify the invalid sample: {v:?}"
+        );
+    }
+
+    #[test]
+    fn rss_leak_non_finite_fit_fails_closed() {
+        // Every input is individually finite, but extreme values overflow
+        // the regression arithmetic. The resulting non-finite fit must not
+        // fall through the `slope > max_slope` comparison as a false pass.
+        let cfg = make_config(thresholds_with(|t| {
+            t.rss_leak_mb_per_sec = Some(0.5);
+        }));
+        let process =
+            process_with_rss_samples(&[(0.0, f64::MAX), (1.0, f64::MAX / 2.0), (2.0, f64::MAX)]);
+        let report = make_report(empty_metrics(), process);
+
+        let v = evaluate_thresholds(&cfg, &report);
+        assert_eq!(v.len(), 1, "non-finite fit must fail closed: {v:?}");
+        assert!(
+            v[0].actual.contains("fitted RSS slope is non-finite"),
+            "actual must identify regression overflow: {v:?}"
+        );
     }
 
     #[test]

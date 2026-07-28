@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Teerapat-Vatpitak/mcp-loadtest"
@@ -24,7 +24,6 @@ sysinfo = "0.32"
 async-trait = "0.1"
 console = "0.15"
 crossterm = "0.28"
-eventsource-stream = "0.2"
 humantime = "2"
 ratatui = "0.29"
 humantime-serde = "1"

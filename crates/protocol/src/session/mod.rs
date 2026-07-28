@@ -34,9 +34,17 @@ pub enum SessionError {
     /// I/O error from the underlying transport (pipe closed, write failed, etc.).
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    /// JSON serialization/deserialization failed.
+    /// JSON serialization or response-envelope parsing failed.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// A valid JSON-RPC success envelope carried a result that did not match
+    /// the shape required by the requested MCP method.
+    ///
+    /// Keeping this distinct from [`SessionError::Json`] lets diagnostics
+    /// distinguish malformed wire JSON from a stale/desynchronized response
+    /// that is valid JSON but belongs to another method.
+    #[error("response shape: {0}")]
+    ResponseShape(serde_json::Error),
     /// The server returned a structured JSON-RPC error.
     #[error(transparent)]
     Server(#[from] ErrorObject),
@@ -50,6 +58,47 @@ pub enum SessionError {
         expected: u64,
         /// Id we received.
         got: u64,
+    },
+    /// The server returned a valid JSON-RPC id that cannot match this
+    /// session's numeric outgoing request id (for example string or null).
+    #[error("id mismatch: sent {expected}, got {got}")]
+    InvalidResponseId {
+        /// Numeric id sent by this session.
+        expected: u64,
+        /// Non-numeric or out-of-range id returned by the server.
+        got: Value,
+    },
+    /// A success response belonged to a different request id.
+    ///
+    /// The opaque result is retained so the raw protocol fuzzer can
+    /// distinguish “server accepted the malformed request” from a rejection;
+    /// it is intentionally omitted from the Display string.
+    #[error("id mismatch: sent {expected}, got {got} (success response)")]
+    MismatchedSuccessResponse {
+        /// Numeric id sent by this session.
+        expected: u64,
+        /// Id returned by the server.
+        got: Value,
+        /// Opaque success result returned for the other request.
+        result: Value,
+    },
+    /// A structured JSON-RPC error response belonged to a different request
+    /// id. Retaining the error code lets the raw fuzzer tell an expected
+    /// malformed-input rejection from an internal server error.
+    #[error("id mismatch: sent {expected}, got {got} ({error})")]
+    MismatchedErrorResponse {
+        /// Numeric id sent by this session.
+        expected: u64,
+        /// Id returned by the server.
+        got: Value,
+        /// Structured error returned for the other request.
+        error: ErrorObject,
+    },
+    /// The response envelope was valid JSON but did not declare JSON-RPC 2.0.
+    #[error("invalid JSON-RPC response version `{got}` (expected `2.0`)")]
+    InvalidJsonRpcVersion {
+        /// Version literal returned by the server.
+        got: String,
     },
     /// `initialize` did not complete within the configured budget.
     #[error("server did not respond to initialize within {0:?}")]

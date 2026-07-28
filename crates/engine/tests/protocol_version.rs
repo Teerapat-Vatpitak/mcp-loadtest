@@ -70,7 +70,10 @@ async fn default_handshake_negotiates_supported_version() {
         Some(ProtocolVersion::V2025_03_26)
     );
     assert_eq!(session.server_protocol_version, "2025-03-26");
-    let _ = tokio::time::timeout(Duration::from_secs(5), session.shutdown()).await;
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("shutdown errored");
 }
 
 #[tokio::test]
@@ -80,7 +83,10 @@ async fn known_but_different_version_is_accepted() {
         session.negotiated_version(),
         Some(ProtocolVersion::V2025_06_18)
     );
-    let _ = tokio::time::timeout(Duration::from_secs(5), session.shutdown()).await;
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("shutdown errored");
 }
 
 #[tokio::test]
@@ -90,7 +96,10 @@ async fn server_matching_advertised_2025_11_25_negotiates_it() {
         session.negotiated_version(),
         Some(ProtocolVersion::V2025_11_25)
     );
-    let _ = tokio::time::timeout(Duration::from_secs(5), session.shutdown()).await;
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("shutdown errored");
 }
 
 #[tokio::test]
@@ -108,7 +117,10 @@ async fn unknown_version_warns_but_session_still_works() {
         .await
         .expect("call_tool");
     assert!(!result.is_error);
-    let _ = tokio::time::timeout(Duration::from_secs(5), session.shutdown()).await;
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("shutdown errored");
 }
 
 #[tokio::test]

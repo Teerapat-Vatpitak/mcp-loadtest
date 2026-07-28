@@ -7,15 +7,17 @@
 //! wrapper types and the stateless constructor; `Session`'s public API is
 //! unchanged (ADR 0019 decision 2).
 //!
-//! Field names follow the **release candidate** (`io.modelcontextprotocol/*`
-//! keys); they are re-verified against the final spec on 2026-07-29 — see
-//! ADR 0019's open questions.
+//! Field names follow the official final schema at
+//! `5f5440bb26a62e2cf3440b92da5a667efa03b267`. The final-only schema change
+//! affects the currently unsupported `subscriptions/listen` method, leaving
+//! this subset unchanged. Stateless mode remains explicit rather than default.
 
 use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
 
+use super::lifecycle::cleanup_failed_startup;
 use super::{Session, SessionError};
 use crate::mcp::{ClientInfo, DiscoverResult, ProtocolVersion};
 use crate::transport::Transport;
@@ -27,7 +29,7 @@ pub(crate) struct StatelessMeta {
     pub(crate) capabilities: Value,
 }
 
-/// The `_meta` block itself (RC reverse-DNS key names).
+/// The `_meta` block itself (reverse-DNS key names).
 #[derive(Serialize)]
 struct MetaBlock<'a> {
     #[serde(rename = "io.modelcontextprotocol/protocolVersion")]
@@ -67,10 +69,9 @@ impl Session {
     /// Construct a **stateless** (2026-07-28) session over any transport
     /// (ADR 0019; wired for stdio + Streamable HTTP). No
     /// `initialize` is sent; instead one bounded `server/discover` probes
-    /// connectivity and capabilities. A server answering `-32601` (method
-    /// not found) is tolerated — the RC positions discover as an optional
-    /// up-front call / backward-compatibility probe — but any transport
-    /// failure fails construction, mirroring the handshake constructors.
+    /// connectivity and capabilities. This is a pinned-modern connection,
+    /// not automatic era negotiation: a missing `server/discover` or a
+    /// response that does not advertise the selected version fails closed.
     pub async fn from_transport_stateless<T>(
         transport: T,
         startup_timeout: Duration,
@@ -97,16 +98,17 @@ impl Session {
             tool_schemas: None,
             tool_output_schemas: None,
         };
-        match tokio::time::timeout(startup_timeout, session.discover()).await {
-            Ok(result) => result?,
-            Err(_) => return Err(SessionError::StartupTimeout(startup_timeout)),
+        // Streamable HTTP requires the version header on *every* POST,
+        // including the first server/discover probe. Other transports no-op.
+        session.transport.set_protocol_version(version.as_str());
+        let startup_result = match tokio::time::timeout(startup_timeout, session.discover()).await {
+            Ok(result) => result,
+            Err(_) => Err(SessionError::StartupTimeout(startup_timeout)),
+        };
+        match startup_result {
+            Ok(()) => Ok(session),
+            Err(error) => Err(cleanup_failed_startup(session, error).await),
         }
-        // Streamable HTTP also carries the revision as the
-        // MCP-Protocol-Version header on every request; other transports
-        // no-op.
-        let negotiated = session.server_protocol_version.clone();
-        session.transport.set_protocol_version(&negotiated);
-        Ok(session)
     }
 
     /// The construct-time `server/discover` probe. Eager (not lazy) by
@@ -119,33 +121,48 @@ impl Session {
             .request("server/discover", &serde_json::json!({}))
             .await;
         match result {
-            Ok(d) => {
-                let advertised = self.advertised_version;
-                let confirmed = d.protocol_version.as_deref() == Some(advertised.as_str())
-                    || d.protocol_versions.iter().any(|v| v == advertised.as_str());
-                if let Some(v) = d.protocol_version {
-                    self.server_protocol_version = v;
+            Ok(d) => self.accept_discovery(d),
+            Err(SessionError::Server(error)) if error.code == -32022 => {
+                // Official client conformance exercises a server asking the
+                // client to retry a supported modern version. Retry once,
+                // but only when the server's structured payload explicitly
+                // contains the version we pinned.
+                let supported = error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("supported"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|versions| {
+                        versions
+                            .iter()
+                            .any(|v| v.as_str() == Some(self.advertised_version.as_str()))
+                    });
+                if !supported {
+                    return Err(SessionError::Server(error));
                 }
-                if confirmed {
-                    self.negotiated_version = Some(advertised);
-                } else {
-                    tracing::warn!(
-                        advertised = %advertised,
-                        reported = %self.server_protocol_version,
-                        "server/discover did not confirm the stateless revision: \
-                         continuing permissively (ADR 0019)"
-                    );
-                }
-                Ok(())
+                let retry: DiscoverResult = self
+                    .request("server/discover", &serde_json::json!({}))
+                    .await?;
+                self.accept_discovery(retry)
             }
-            Err(SessionError::Server(e)) if e.code == -32601 => {
-                tracing::warn!(
-                    "server does not implement server/discover (-32601): continuing \
-                     without capability discovery (RC backward-compatibility probe)"
-                );
-                Ok(())
-            }
-            Err(e) => Err(e),
+            Err(error) => Err(error),
         }
+    }
+
+    fn accept_discovery(&mut self, discovery: DiscoverResult) -> Result<(), SessionError> {
+        let advertised = self.advertised_version;
+        if !discovery
+            .supported_versions
+            .iter()
+            .any(|version| version == advertised.as_str())
+        {
+            return Err(SessionError::UnsupportedProtocolVersion {
+                got: discovery.supported_versions.join(","),
+                advertised: advertised.to_string(),
+            });
+        }
+        self.server_protocol_version = advertised.to_string();
+        self.negotiated_version = Some(advertised);
+        Ok(())
     }
 }

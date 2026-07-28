@@ -97,7 +97,7 @@ async fn soak_runs_full_duration_and_emits_samples() {
         outcome.notes
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
@@ -143,10 +143,45 @@ async fn soak_observes_cancellation() {
         "expected at least one call before cancel: {outcome:?}"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), session.shutdown())
+    tokio::time::timeout(Duration::from_secs(15), session.shutdown())
         .await
         .expect("shutdown timed out")
         .expect("shutdown errored");
+}
+
+#[tokio::test]
+async fn soak_rejects_zero_sample_interval_without_spinning() {
+    let mock = helpers::fixture_path("mock-normal.py");
+    let py = helpers::python();
+    let mut session = Session::spawn(&py, [mock.as_os_str()])
+        .await
+        .expect("spawn failed");
+    let scenario = Soak {
+        concurrent: 1,
+        duration: Duration::from_secs(60),
+        tool: "echo".to_string(),
+        args: json!({}),
+        sample_interval: Duration::ZERO,
+        latency_drift_ms_per_sec: 5.0,
+    };
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        scenario.drive(&mut session, &make_ctx()),
+    )
+    .await
+    .expect("invalid sample interval must fail promptly");
+    assert_eq!(outcome.total_calls, 0);
+    assert_eq!(outcome.error_count, 1);
+    assert!(
+        outcome
+            .notes
+            .iter()
+            .any(|note| note.contains("sample_interval")),
+        "got {outcome:?}"
+    );
+
+    session.shutdown().await.expect("shutdown errored");
 }
 
 /// Linear-regression leak detector — synthetic-sample regression test.

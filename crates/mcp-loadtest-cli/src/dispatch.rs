@@ -48,7 +48,19 @@ pub(crate) async fn dispatch(cmd: Cmd) -> Result<()> {
             capture_stderr,
             tee_stderr,
             trace,
-        } => cmd_run::run_from_config(&config, capture_stderr, tee_stderr, trace).await,
+            action_output_dir,
+            action_redact_server_identity,
+        } => {
+            cmd_run::run_from_config_with_output(
+                &config,
+                capture_stderr,
+                tee_stderr,
+                trace,
+                action_output_dir,
+                action_redact_server_identity,
+            )
+            .await
+        }
         Cmd::Replay {
             trace_file,
             server,
@@ -74,7 +86,14 @@ pub(crate) async fn dispatch(cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Doctor { server, runs_dir } => cmd_doctor::run_doctor(server, runs_dir).await,
+        Cmd::Doctor {
+            server,
+            runs_dir,
+            action_redact_server_identity,
+        } => {
+            cmd_doctor::run_doctor_with_redaction(server, runs_dir, action_redact_server_identity)
+                .await
+        }
         Cmd::Compare {
             baseline,
             current,
@@ -101,8 +120,9 @@ pub(crate) async fn dispatch(cmd: Cmd) -> Result<()> {
             grace_period,
             args,
             output_dir,
+            action_redact_server_identity,
         } => {
-            cmd_deadlock::run_deadlock_probe(
+            cmd_deadlock::run_deadlock_probe_with_redaction(
                 &server,
                 &tool,
                 concurrent,
@@ -110,6 +130,7 @@ pub(crate) async fn dispatch(cmd: Cmd) -> Result<()> {
                 cmd_run::parse_dur_str(&grace_period)?,
                 &args,
                 &output_dir,
+                action_redact_server_identity,
             )
             .await
         }
@@ -120,6 +141,7 @@ pub(crate) async fn dispatch(cmd: Cmd) -> Result<()> {
             duration,
             scenario,
             output_dir,
+            action_redact_server_identity,
         } => {
             let cross_args = cmd_cross::CrossArgs {
                 servers,
@@ -128,10 +150,11 @@ pub(crate) async fn dispatch(cmd: Cmd) -> Result<()> {
                 duration: cmd_run::parse_dur_str(&duration)?,
                 scenario: cmd_cross::CrossScenario::parse(&scenario)?,
                 output_dir,
+                redact_server_identity: action_redact_server_identity,
             };
-            let rendered = cmd_cross::run(cross_args).await?;
-            print_stdout(&rendered);
-            Ok(())
+            let outcome = cmd_cross::run(cross_args).await?;
+            print_stdout(&outcome.rendered);
+            outcome.gate()
         }
         Cmd::Serve { mcp } => {
             if !mcp {
