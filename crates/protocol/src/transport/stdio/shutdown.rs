@@ -54,11 +54,29 @@ async fn stop_and_reap_child(transport: &mut StdioTransport) -> Result<(), Trans
         return Ok(());
     };
 
-    if let Ok(Ok(_status)) = tokio::time::timeout(GRACEFUL_CHILD_EXIT_BUDGET, child.wait()).await {
-        return Ok(());
+    match tokio::time::timeout(GRACEFUL_CHILD_EXIT_BUDGET, child.wait()).await {
+        Ok(Ok(_status)) => return Ok(()),
+        Ok(Err(_wait_error)) => {
+            // A failed asynchronous wait may still be recoverable by
+            // terminating and then waiting again, so use the same bounded
+            // cleanup path below. Preserve an immediately observable OS
+            // status first: on Windows the registered wait callback can fail
+            // or lag even though `try_wait` can already see the process exit.
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return Ok(());
+            }
+        }
+        Err(_) => {
+            // Tokio's Windows process waiter is notified through
+            // RegisterWaitForSingleObject. Under process-heavy contention the
+            // callback can arrive after the OS process has already exited.
+            // Reconcile directly with the OS before escalating a delayed
+            // notification into an unnecessary forced termination.
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return Ok(());
+            }
+        }
     }
-    // A failed asynchronous wait may still be recoverable by terminating and
-    // then waiting again, so use the same bounded cleanup path.
 
     // `start_kill` only requests termination. Always follow it with a bounded
     // wait so successful shutdown means the process actually exited/reaped.
@@ -66,11 +84,42 @@ async fn stop_and_reap_child(transport: &mut StdioTransport) -> Result<(), Trans
     let kill_result = child.start_kill();
     match tokio::time::timeout(FORCED_CHILD_REAP_BUDGET, child.wait()).await {
         Ok(Ok(_status)) => Ok(()),
-        Ok(Err(wait_error)) => Err(TransportError::Io(wait_error)),
-        Err(_) => match kill_result {
+        Ok(Err(wait_error)) => match child.try_wait() {
+            Ok(Some(_status)) => Ok(()),
+            Ok(None) => Err(TransportError::Io(wait_error)),
+            Err(probe_error) => Err(TransportError::Other(format!(
+                "forced child wait failed ({wait_error}); final exit-status probe failed: \
+                 {probe_error}"
+            ))),
+        },
+        Err(_) => {
+            // Do not report a false teardown failure merely because Tokio's
+            // async process-exit callback was delayed. `try_wait` directly
+            // observes and reaps the child when the OS has completed the
+            // termination request.
+            resolve_forced_wait_timeout(
+                child.try_wait().map(|status| status.is_some()),
+                kill_result,
+            )
+        }
+    }
+}
+
+/// Reconcile an expired async forced-wait with the process table before
+/// reporting a timeout. Tokio's registered Windows wait notification can lag
+/// the observable process state under contention; only `Ok(false)` proves the
+/// child is still live after the final direct probe.
+fn resolve_forced_wait_timeout(
+    exit_probe: io::Result<bool>,
+    kill_result: io::Result<()>,
+) -> Result<(), TransportError> {
+    match exit_probe {
+        Ok(true) => Ok(()),
+        Ok(false) => match kill_result {
             Ok(()) => Err(TransportError::Timeout(FORCED_CHILD_REAP_BUDGET)),
             Err(kill_error) => Err(TransportError::Io(kill_error)),
         },
+        Err(probe_error) => Err(TransportError::Io(probe_error)),
     }
 }
 
@@ -149,6 +198,44 @@ fn map_pump_join(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_forced_wait_notification_accepts_proven_process_exit() {
+        resolve_forced_wait_timeout(Ok(true), Ok(()))
+            .expect("a direct OS exit observation must override a delayed async callback");
+    }
+
+    #[test]
+    fn forced_wait_timeout_remains_fail_closed_for_live_process() {
+        let error = resolve_forced_wait_timeout(Ok(false), Ok(()))
+            .expect_err("a process still live after the final probe must fail");
+        assert!(matches!(
+            error,
+            TransportError::Timeout(FORCED_CHILD_REAP_BUDGET)
+        ));
+    }
+
+    #[test]
+    fn forced_wait_final_probe_error_is_not_a_false_success() {
+        let error = resolve_forced_wait_timeout(
+            Err(io::Error::other("injected process-table failure")),
+            Ok(()),
+        )
+        .expect_err("an uncertain final process state must fail");
+        assert!(matches!(error, TransportError::Io(ref io_error)
+                if io_error.to_string() == "injected process-table failure"));
+    }
+
+    #[test]
+    fn forced_wait_live_process_preserves_kill_error() {
+        let error = resolve_forced_wait_timeout(
+            Ok(false),
+            Err(io::Error::other("injected termination failure")),
+        )
+        .expect_err("a live process plus failed termination must fail");
+        assert!(matches!(error, TransportError::Io(ref io_error)
+                if io_error.to_string() == "injected termination failure"));
+    }
 
     #[test]
     fn pump_io_error_makes_shutdown_mapping_fail_closed() {

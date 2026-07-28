@@ -132,6 +132,15 @@ workspace version was never tagged or released.
   past the test default, so the deadlock integration test now uses a test-local
   30-second startup budget. The production 10-second default and strict
   complete-worker/pass/fail assertions are unchanged.
+- The no-retry release repeat gate exposed nine Windows stdio shutdown
+  failures across two of five attempts. Tokio's registered process-wait
+  callback could lag the process table during the 24-way subprocess wave, so
+  an accepted termination was misreported as a 2-second forced-reap timeout.
+  Stdio teardown now reconciles both graceful and forced async-wait failures
+  with a direct `try_wait` probe: a proven exit/reap succeeds, a still-live
+  process or failed probe remains a typed failure. The release procedure keeps
+  the original failed JUnit and logs as unresolved local evidence rather than
+  discarding them.
 - The hang watchdog now classifies successful calls from elapsed wall time,
   not merely the winning `select!` branch. Under a saturated executor the call
   future and threshold timer could become ready in the same poll; the old
