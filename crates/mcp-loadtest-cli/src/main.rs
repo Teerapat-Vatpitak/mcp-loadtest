@@ -53,6 +53,9 @@ pub(crate) enum Cmd {
     /// Print a sample TOML config to stdout.
     ExampleConfig,
 
+    /// Print the bundled Draft 2020-12 config JSON Schema to stdout.
+    ConfigSchema,
+
     /// List built-in scenario kinds and a one-line description of each.
     ListScenarios,
 
@@ -205,6 +208,14 @@ pub(crate) enum Cmd {
         /// supported variant — HTTP/SSE serve modes are deferred.
         #[arg(long, default_value_t = true)]
         mcp: bool,
+    },
+
+    /// Internal ephemeral worker entrypoint. Invoked only by the SSH controller.
+    #[command(name = "__distributed-agent", hide = true)]
+    DistributedAgent {
+        /// Carry the versioned control protocol over stdin/stdout.
+        #[arg(long, default_value_t = true)]
+        stdio: bool,
     },
 }
 

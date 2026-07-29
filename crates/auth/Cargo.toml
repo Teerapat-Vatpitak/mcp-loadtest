@@ -1,0 +1,27 @@
+[package]
+name = "mcp-loadtest-auth"
+description = "MCP 2026-07-28 OAuth client authorization primitives for mcp-loadtest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.22"
+rand = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true, features = ["serde"] }
+zeroize = "1"
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -76,7 +76,9 @@ failed_runs=0
     printf 'git_status_end\n'
 } >"$output_dir/environment.txt" 2>&1
 while IFS= read -r -d '' source_file; do
-    printf '%s\t%s\n' "$(git hash-object -- "$source_file")" "$source_file"
+    if [[ -f "$source_file" || -L "$source_file" ]]; then
+        printf '%s\t%s\n' "$(git hash-object -- "$source_file")" "$source_file"
+    fi
 done < <(git ls-files --cached --others --exclude-standard -z) \
     >"$output_dir/source-files.git-hash"
 

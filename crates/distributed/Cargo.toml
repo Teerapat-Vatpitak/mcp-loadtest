@@ -1,0 +1,27 @@
+[package]
+name = "mcp-loadtest-distributed"
+description = "Distributed controller, worker protocol, and exact metric aggregation for mcp-loadtest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+base64 = "0.22"
+hdrhistogram = { workspace = true }
+mcp-loadtest-core = { path = "../core", version = "0.2.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

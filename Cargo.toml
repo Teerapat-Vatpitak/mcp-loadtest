@@ -3,9 +3,9 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/Teerapat-Vatpitak/mcp-loadtest"
 homepage = "https://github.com/Teerapat-Vatpitak/mcp-loadtest"
 authors = ["Teerapat Vatpitak"]
@@ -38,6 +38,7 @@ ulid = "1"
 anyhow = "1"
 rand = "0.9"
 criterion = "0.5"
+sha2 = "0.10"
 
 [workspace.lints.rust]
 missing_docs = "deny"

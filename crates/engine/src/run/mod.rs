@@ -6,19 +6,39 @@
 //! [`Report`]: mcp_loadtest_core::report::Report
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use mcp_loadtest_core::config::Config;
+use mcp_loadtest_core::metrics::{Recorder, ScenarioMetrics};
+use mcp_loadtest_core::report::Report;
 use mcp_loadtest_protocol::session::SessionError;
 use thiserror::Error;
 
-use crate::scenario::Scenario;
+use crate::scenario::{Scenario, TrafficStartGate};
 
 pub mod factory;
 
 mod connect;
 mod executor;
 mod thresholds;
+
+/// Apply the same global and per-tool pass/fail thresholds used by
+/// [`Run::execute`] to a report assembled by a distributed controller.
+///
+/// Distributed execution merges exact recorder evidence outside the local
+/// orchestrator, so it needs this narrow public adapter instead of
+/// duplicating threshold semantics in the CLI.
+pub fn evaluate_report_thresholds(
+    config: &Config,
+    report: &mut Report,
+    per_tool: &std::collections::BTreeMap<String, ScenarioMetrics>,
+) {
+    report.threshold_violations = thresholds::evaluate_thresholds(config, report);
+    report
+        .threshold_violations
+        .extend(thresholds::evaluate_tool_slos(config, per_tool));
+}
 
 /// How a spawned (stdio) server's stderr is handled for a run.
 ///
@@ -65,6 +85,13 @@ pub struct Run {
     /// reserved for the composite Action; ordinary CLI runs remain
     /// self-describing. Set via [`Run::with_redacted_server_identity`].
     pub redact_server_identity: bool,
+    /// Optional caller-owned recorder. Distributed workers retain a clone so
+    /// they can serialize exact HDR evidence after `execute` returns.
+    pub metrics_recorder: Option<Recorder>,
+    /// Optional distributed traffic-start barrier.
+    pub traffic_start_gate: Option<Arc<dyn TrafficStartGate>>,
+    /// Optional deterministic weighted-pattern seed.
+    pub rng_seed: Option<u64>,
 }
 
 /// Errors that can fail an entire run.
@@ -96,6 +123,9 @@ impl Run {
             stderr_capture: StderrCapture::Off,
             trace_path: None,
             redact_server_identity: false,
+            metrics_recorder: None,
+            traffic_start_gate: None,
+            rng_seed: None,
         }
     }
 
@@ -130,6 +160,27 @@ impl Run {
     #[must_use]
     pub fn with_redacted_server_identity(mut self) -> Self {
         self.redact_server_identity = true;
+        self
+    }
+
+    /// Use a caller-owned metrics recorder.
+    #[must_use]
+    pub fn with_metrics_recorder(mut self, recorder: Recorder) -> Self {
+        self.metrics_recorder = Some(recorder);
+        self
+    }
+
+    /// Wait at a controller-managed barrier after local sessions are ready.
+    #[must_use]
+    pub fn with_traffic_start_gate(mut self, gate: Arc<dyn TrafficStartGate>) -> Self {
+        self.traffic_start_gate = Some(gate);
+        self
+    }
+
+    /// Use deterministic weighted-pattern selection.
+    #[must_use]
+    pub fn with_rng_seed(mut self, seed: u64) -> Self {
+        self.rng_seed = Some(seed);
         self
     }
 }

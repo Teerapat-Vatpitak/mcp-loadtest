@@ -7,7 +7,9 @@ use anyhow::{Context, Result};
 
 use mcp_loadtest::report::html::HtmlReporter;
 use mcp_loadtest::report::json::JsonReporter;
+use mcp_loadtest::report::junit::JunitReporter;
 use mcp_loadtest::report::markdown::MarkdownReporter;
+use mcp_loadtest::report::prometheus::PrometheusReporter;
 use mcp_loadtest::report::terminal::TerminalReporter;
 use mcp_loadtest::report::{Report, Reporter};
 
@@ -36,6 +38,16 @@ pub(crate) fn emit_reports(report: &Report, formats: &[String], output_dir: &Pat
             "html" => {
                 let s = HtmlReporter.render(report)?;
                 let path = run_dir.join("report.html");
+                std::fs::write(&path, s).with_context(|| format!("writing {}", path.display()))?;
+            }
+            "junit" => {
+                let s = JunitReporter.render(report)?;
+                let path = run_dir.join("junit.xml");
+                std::fs::write(&path, s).with_context(|| format!("writing {}", path.display()))?;
+            }
+            "prometheus" => {
+                let s = PrometheusReporter.render(report)?;
+                let path = run_dir.join("metrics.prom");
                 std::fs::write(&path, s).with_context(|| format!("writing {}", path.display()))?;
             }
             other => eprintln!("warning: unknown output format `{other}` (ignored)"),

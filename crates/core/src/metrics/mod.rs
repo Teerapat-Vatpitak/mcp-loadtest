@@ -26,6 +26,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use hdrhistogram::Histogram;
+
 use crate::metrics::histogram::ShardedHistogram;
 use crate::metrics::throughput::{OutcomeCounters, requests_per_sec};
 
@@ -183,6 +185,29 @@ impl Recorder {
             out.insert(name.clone(), per_tool_snapshot(state));
         }
         out
+    }
+
+    /// Return the exact merged latency histogram used by [`Self::snapshot`].
+    ///
+    /// Distributed workers serialize this evidence with the interoperable
+    /// HDR Histogram V2 codec so the coordinator can merge the underlying
+    /// distributions. Percentiles must never be averaged across workers.
+    pub fn latency_histogram(&self) -> Histogram<u64> {
+        self.inner.latency.merged()
+    }
+
+    /// Return exact merged latency histograms keyed by tool name.
+    ///
+    /// The keys match [`Self::snapshot_per_tool`]. Only tools recorded with
+    /// [`Self::record_tool`] are present.
+    pub fn per_tool_latency_histograms(&self) -> BTreeMap<String, Histogram<u64>> {
+        let map = match self.inner.per_tool.read() {
+            Ok(guard) => guard,
+            Err(_) => return BTreeMap::new(),
+        };
+        map.iter()
+            .map(|(name, state)| (name.clone(), state.latency.merged()))
+            .collect()
     }
 
     /// Snapshot the current state into a readable summary for reporting.
@@ -504,5 +529,26 @@ mod tests {
         assert!(r.snapshot_per_tool().is_empty());
         // But the global snapshot still records it for back-compat.
         assert_eq!(r.snapshot().throughput.total_requests, 1);
+    }
+
+    #[test]
+    fn exact_histogram_evidence_matches_readable_snapshots() {
+        let r = Recorder::new();
+        r.record_tool("echo", Duration::from_micros(100), CallOutcome::Success);
+        r.record_tool("echo", Duration::from_micros(300), CallOutcome::Hang);
+        r.record_tool("compute", Duration::from_micros(500), CallOutcome::Success);
+
+        let global = r.latency_histogram();
+        assert_eq!(global.len(), r.snapshot().latency.count);
+        assert_eq!(global.min(), 100);
+        assert_eq!(global.max(), 500);
+
+        let per_tool = r.per_tool_latency_histograms();
+        assert_eq!(per_tool["echo"].len(), 2);
+        assert_eq!(per_tool["compute"].len(), 1);
+        assert_eq!(
+            per_tool["echo"].len(),
+            r.snapshot_per_tool()["echo"].latency.count
+        );
     }
 }

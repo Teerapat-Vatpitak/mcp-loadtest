@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Pin the exact official final specification revision and the latest reviewed
-# conformance harness revision. The harness still labels this wire version as
-# draft, so the claim remains limited to the explicitly executed scenarios.
+# Pin the exact official final specification and reviewed conformance harness
+# revisions. The release claim covers every applicable client scenario marked
+# `executed` in the checked-in scope manifest, with no expected failures.
 conformance_ref="49103de6ed70804e940637bf3e9e29e4a3f54e64"
 conformance_spec_source="71e306956a4959c9655e5036be215d41986596e6"
 spec_ref="5f5440bb26a62e2cf3440b92da5a667efa03b267"
@@ -660,9 +660,9 @@ fi
   printf 'conformance_main_at_verification=%s\n' "$latest_conformance"
   printf 'conformance_vendored_spec_source=%s\n' \
     "$resolved_conformance_source"
-  printf 'conformance_status=latest official harness at verification; version still DRAFT/provisional\n'
-  printf 'claim=final-spec-reconciled subset; latest official scoped tools/discover, request-metadata, and request-header scenarios are unaffected by the final subscriptions-only schema delta\n'
-  printf 'excluded=full suite, auth, MRTR/request-state, subscriptions/listen, schema-reference, server, authorization-server\n'
+  printf 'conformance_status=pinned official client harness at verification\n'
+  printf 'claim=full applicable MCP 2026-07-28 client-role scenario inventory\n'
+  printf 'excluded=server role, authorization-server role, subscriptions/listen\n'
 } >"$results/UPSTREAM_STATUS.txt"
 
 {
@@ -670,17 +670,16 @@ fi
   printf 'conformance=%s\n' "$conformance_ref"
   printf 'conformance_main_at_verification=%s\n' "$latest_conformance"
   printf 'conformance_vendored_spec_source=%s\n' "$conformance_spec_source"
-  printf 'conformance_status=latest official harness; version still DRAFT/provisional\n'
-  printf 'protocol=2026-07-28 final-spec-reconciled subset (scoped tools/discover, request-metadata, and request-header client scenarios only)\n'
+  printf 'conformance_status=pinned official client harness\n'
+  printf 'protocol=2026-07-28 full applicable client-role scenario inventory\n'
 } >"$results/PINNED_REFS.txt"
 
-scenarios=(
-  request-metadata
-  tools_call
-  http-standard-headers
-  http-custom-headers
-  http-invalid-tool-headers
+mapfile -t scenarios < <(
+  awk -F '\t' 'NR > 1 && $2 == "executed" { print $1 }' "$scope_manifest"
 )
+if [ "${#scenarios[@]}" -eq 0 ]; then
+  fail "scope manifest contains no executed client scenarios"
+fi
 
 # Retain the official client-scenario inventory and prove that the reviewed
 # scope manifest names every applicable scenario exactly once.

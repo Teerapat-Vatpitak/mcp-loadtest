@@ -14,9 +14,11 @@
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use mcp_loadtest_auth::{AuthorizationContext, BearerChallenge, MemoryTokenStore, OAuthProvider};
 use mcp_loadtest_core::config::validate_remote_endpoint;
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde_json::Value;
+use std::sync::Arc;
 use url::Url;
 
 use super::guard::HostGuard;
@@ -32,6 +34,7 @@ const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 const STATELESS_PROTOCOL_VERSION: &str = "2026-07-28";
 const MAX_HTTP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SSE_NON_RESPONSE_EVENTS: usize = 256;
+const MAX_OAUTH_REAUTH_ATTEMPTS: usize = 2;
 
 /// HTTP transport — owns a reusable `reqwest::Client` and the endpoint URL.
 ///
@@ -46,9 +49,96 @@ pub struct HttpTransport {
     protocol_version: Option<HeaderValue>,
     remote_headers: RemoteHeaders,
     tool_headers: ToolHeaderRegistry,
+    oauth: Option<HttpOAuth>,
+}
+
+struct HttpOAuth {
+    binding: tokio::sync::RwLock<OAuthBinding>,
+    challenge_handler: Option<Arc<dyn OAuthChallengeHandler>>,
+}
+
+#[derive(Clone)]
+struct OAuthBinding {
+    provider: Arc<OAuthProvider<MemoryTokenStore>>,
+    context: AuthorizationContext,
+}
+
+/// Run-scoped callback used to satisfy bounded 401/403 OAuth challenges.
+#[async_trait]
+pub trait OAuthChallengeHandler: Send + Sync {
+    /// Obtain a new issuer/resource-bound provider after validating the
+    /// challenge and applying the caller's bounded scope-step-up policy. The
+    /// transport independently caps reauthorization at two attempts per MCP
+    /// request even if the handler keeps returning credentials.
+    async fn reauthorize(
+        &self,
+        challenge: BearerChallenge,
+    ) -> Result<(Arc<OAuthProvider<MemoryTokenStore>>, AuthorizationContext), TransportError>;
 }
 
 impl HttpTransport {
+    /// Probe the protected MCP endpoint for its OAuth Bearer challenge.
+    ///
+    /// The request uses the same DNS-vetted, address-pinned client as normal
+    /// transport traffic. A successful unauthenticated response returns
+    /// `None`; a 401/403 must contain one valid Bearer challenge.
+    pub async fn discover_oauth_challenge(
+        url: impl AsRef<str>,
+        guard: &HostGuard,
+        remote_headers: RemoteHeaders,
+    ) -> Result<Option<BearerChallenge>, TransportError> {
+        let url = validate_remote_endpoint(url.as_ref(), "http", !remote_headers.is_empty())
+            .map_err(TransportError::Other)?;
+        let addrs = resolve::resolve_and_check(&url, guard).await?;
+        let client = resolve::pinned_client(&url, &addrs)?;
+        let request = remote_headers.apply_reqwest(
+            client
+                .post(url)
+                .header(CONTENT_TYPE, "application/json")
+                .header(ACCEPT, "application/json")
+                .header(MCP_PROTOCOL_VERSION_HEADER, STATELESS_PROTOCOL_VERSION)
+                .header("Mcp-Method", "server/discover")
+                .json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "server/discover",
+                    "params": {}
+                })),
+        );
+        let response = request.send().await.map_err(|error| {
+            TransportError::Http(format!("OAuth probe: {}", error.without_url()))
+        })?;
+        if response.status().is_success() {
+            return Ok(None);
+        }
+        if response.status() != reqwest::StatusCode::UNAUTHORIZED
+            && response.status() != reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(TransportError::Http(format!(
+                "OAuth probe status {}",
+                response.status().as_u16()
+            )));
+        }
+        let values = response
+            .headers()
+            .get_all(reqwest::header::WWW_AUTHENTICATE)
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_owned)
+                    .map_err(|_| TransportError::Other("invalid OAuth challenge header".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let refs = values.iter().map(String::as_str).collect::<Vec<_>>();
+        BearerChallenge::parse(&refs)
+            .map_err(|error| TransportError::Other(format!("invalid OAuth challenge: {error}")))?
+            .map(Some)
+            .ok_or_else(|| {
+                TransportError::Other("OAuth response omitted a Bearer challenge".into())
+            })
+    }
+
     /// Build an [`HttpTransport`] pointing at `url`. For hostname URLs this
     /// performs one DNS resolution up front so the addresses can be vetted
     /// and pinned (ADR 0016); the TCP connection itself is established lazily
@@ -85,7 +175,47 @@ impl HttpTransport {
             protocol_version: None,
             remote_headers,
             tool_headers: ToolHeaderRegistry::default(),
+            oauth: None,
         })
+    }
+
+    /// Connect with an already configured OAuth provider and discovered
+    /// authorization context. The provider is consulted before every HTTP
+    /// request, including refresh-on-expiry; bearer tokens are never copied
+    /// into transport configuration or debug output.
+    pub async fn connect_with_oauth(
+        url: impl AsRef<str>,
+        guard: &HostGuard,
+        remote_headers: RemoteHeaders,
+        provider: Arc<OAuthProvider<MemoryTokenStore>>,
+        context: AuthorizationContext,
+    ) -> Result<Self, TransportError> {
+        reject_static_authorization_header(&remote_headers)?;
+        let mut transport = Self::connect_with_headers(url, guard, remote_headers).await?;
+        transport.oauth = Some(HttpOAuth {
+            binding: tokio::sync::RwLock::new(OAuthBinding { provider, context }),
+            challenge_handler: None,
+        });
+        Ok(transport)
+    }
+
+    /// Connect with OAuth plus a bounded challenge handler for incremental
+    /// consent or reauthorization after a protected request returns 401/403.
+    pub async fn connect_with_oauth_handler(
+        url: impl AsRef<str>,
+        guard: &HostGuard,
+        remote_headers: RemoteHeaders,
+        provider: Arc<OAuthProvider<MemoryTokenStore>>,
+        context: AuthorizationContext,
+        challenge_handler: Arc<dyn OAuthChallengeHandler>,
+    ) -> Result<Self, TransportError> {
+        reject_static_authorization_header(&remote_headers)?;
+        let mut transport = Self::connect_with_headers(url, guard, remote_headers).await?;
+        transport.oauth = Some(HttpOAuth {
+            binding: tokio::sync::RwLock::new(OAuthBinding { provider, context }),
+            challenge_handler: Some(challenge_handler),
+        });
+        Ok(transport)
     }
 
     /// POST `body` as `application/json` and return the raw response body.
@@ -95,33 +225,98 @@ impl HttpTransport {
         body: &str,
         expects_response: bool,
     ) -> Result<reqwest::Response, TransportError> {
-        let mut req = self.remote_headers.apply_reqwest(
-            self.client
-                .post(self.url.clone())
-                .header(CONTENT_TYPE, "application/json")
-                .header(ACCEPT, "application/json, text/event-stream"),
-        );
-        if let Some(version) = &self.protocol_version {
-            req = req.header(MCP_PROTOCOL_VERSION_HEADER, version.clone());
-        }
-        if expects_response && self.is_stateless() {
-            let prepared = self.tool_headers.prepare(body)?;
-            for (name, value) in &prepared.headers {
-                req = req.header(name, value);
+        let mut reauthorization_attempts = 0_usize;
+        loop {
+            let mut req = self.remote_headers.apply_reqwest(
+                self.client
+                    .post(self.url.clone())
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(ACCEPT, "application/json, text/event-stream"),
+            );
+            if let Some(oauth) = &self.oauth {
+                let binding = oauth.binding.read().await.clone();
+                if let Some(header) = binding
+                    .provider
+                    .authorization_header(&binding.context)
+                    .await
+                    .map_err(|error| {
+                        TransportError::Other(format!("OAuth authorization failed: {error}"))
+                    })?
+                {
+                    req = header.apply(req);
+                }
             }
+            if let Some(version) = &self.protocol_version {
+                req = req.header(MCP_PROTOCOL_VERSION_HEADER, version.clone());
+            }
+            if expects_response && self.is_stateless() {
+                let prepared = self.tool_headers.prepare(body)?;
+                for (name, value) in &prepared.headers {
+                    req = req.header(name, value);
+                }
+            }
+            let resp = req
+                .body(body.to_owned())
+                .send()
+                .await
+                .map_err(|e| TransportError::Http(format!("post: {}", e.without_url())))?;
+            let auth_status = resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                || resp.status() == reqwest::StatusCode::FORBIDDEN;
+            let Some(oauth) = &self.oauth else {
+                return Ok(resp);
+            };
+            let Some(handler) = &oauth.challenge_handler else {
+                return Ok(resp);
+            };
+            if !auth_status {
+                return Ok(resp);
+            }
+            if reauthorization_attempts >= MAX_OAUTH_REAUTH_ATTEMPTS {
+                return Err(TransportError::Other(
+                    "OAuth challenge retry limit exceeded".into(),
+                ));
+            }
+            reauthorization_attempts += 1;
+            let challenge = parse_bearer_challenge(resp.headers())?;
+            let (provider, context) = handler.reauthorize(challenge).await?;
+            *oauth.binding.write().await = OAuthBinding { provider, context };
         }
-        let resp = req
-            .body(body.to_owned())
-            .send()
-            .await
-            .map_err(|e| TransportError::Http(format!("post: {}", e.without_url())))?;
-        Ok(resp)
     }
 
     fn is_stateless(&self) -> bool {
         self.protocol_version.as_ref().and_then(|v| v.to_str().ok())
             == Some(STATELESS_PROTOCOL_VERSION)
     }
+}
+
+fn reject_static_authorization_header(
+    remote_headers: &RemoteHeaders,
+) -> Result<(), TransportError> {
+    if remote_headers.iter().any(|(name, _)| name == AUTHORIZATION) {
+        return Err(TransportError::Other(
+            "static Authorization header cannot be combined with OAuth".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_bearer_challenge(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<BearerChallenge, TransportError> {
+    let values = headers
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| TransportError::Other("invalid OAuth challenge header".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let refs = values.iter().map(String::as_str).collect::<Vec<_>>();
+    BearerChallenge::parse(&refs)
+        .map_err(|error| TransportError::Other(format!("invalid OAuth challenge: {error}")))?
+        .ok_or_else(|| TransportError::Other("OAuth response omitted a Bearer challenge".into()))
 }
 
 #[async_trait]

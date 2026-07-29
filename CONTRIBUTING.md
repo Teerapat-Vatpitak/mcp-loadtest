@@ -40,4 +40,6 @@ Project-wide conventions:
 
 ## License
 
-By contributing, you agree your contributions are dual-licensed under MIT and Apache-2.0, matching the project license.
+By contributing, you agree that your contributions are licensed under
+Apache-2.0, matching the current project license. The immutable `v0.1.0`
+release retains its original `MIT OR Apache-2.0` terms.

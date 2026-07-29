@@ -6,6 +6,7 @@
 //! core.
 
 pub mod grading;
+pub mod history;
 pub mod regression;
 pub mod report;
 

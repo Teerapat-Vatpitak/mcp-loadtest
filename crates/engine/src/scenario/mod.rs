@@ -3,6 +3,7 @@
 //! Each scenario lives in its own file: one `impl Scenario` per module,
 //! registered by its config `type` string in the CLI scenario builder.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -54,6 +55,47 @@ pub trait Scenario: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
+/// Coordinator-controlled traffic start barrier.
+///
+/// Distributed workers call this only after every local MCP session has
+/// completed startup. Implementations announce readiness, wait for the
+/// controller's `Start` frame, and return the local monotonic instant at
+/// which traffic should begin.
+#[async_trait]
+pub trait TrafficStartGate: Send + Sync {
+    /// Announce local readiness and return the coordinated local start
+    /// instant. Errors fail the run closed before any traffic is generated.
+    async fn ready_and_start_at(
+        &self,
+        readiness: TrafficReadiness,
+    ) -> Result<Instant, TrafficStartError>;
+}
+
+/// Evidence announced when a local worker reaches the traffic barrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrafficReadiness {
+    /// Local sessions that completed target startup.
+    pub live_workers: u32,
+    /// Local sessions assigned by the coordinator.
+    pub requested_workers: u32,
+    /// Target protocol revision observed during discovery.
+    pub target_protocol_version: String,
+    /// SHA-256 of the canonical target tool inventory.
+    pub tool_inventory_hash: String,
+}
+
+/// Failure while waiting for a coordinated traffic start.
+#[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
+pub enum TrafficStartError {
+    /// The controller cancelled the job before traffic started.
+    #[error("coordinator cancelled the run before traffic start")]
+    Cancelled,
+    /// The controller channel or state machine failed.
+    #[error("coordinator start gate failed: {0}")]
+    Coordinator(String),
+}
+
 /// Per-run context shared between scenarios and the orchestrator.
 ///
 /// **Locked for M2.** Construct via [`RunContext::new`] — `#[non_exhaustive]`
@@ -77,6 +119,17 @@ pub struct RunContext {
     /// server process per measurement (`cold_start`) check this and degrade
     /// with an explanatory note when absent.
     pub session_factory: Option<SessionFactory>,
+    /// Optional external barrier used by distributed workers. Local runs
+    /// leave this unset and start immediately after their session pool is
+    /// ready.
+    pub traffic_start_gate: Option<Arc<dyn TrafficStartGate>>,
+    /// Optional deterministic base seed for weighted pattern selection.
+    /// Distributed workers assign a shard-specific seed and derive one
+    /// independent stream per local worker.
+    pub rng_seed: Option<u64>,
+    /// Protocol revision and canonical tool inventory established by the
+    /// orchestrator's startup discovery.
+    pub target_identity: Option<(String, String)>,
 }
 
 impl RunContext {
@@ -96,6 +149,9 @@ impl RunContext {
             hang_threshold,
             grace_period,
             session_factory: None,
+            traffic_start_gate: None,
+            rng_seed: None,
+            target_identity: None,
         }
     }
 
@@ -106,6 +162,32 @@ impl RunContext {
     #[must_use]
     pub fn with_session_factory(mut self, factory: SessionFactory) -> Self {
         self.session_factory = Some(factory);
+        self
+    }
+
+    /// Attach a controller-managed traffic start barrier.
+    #[must_use]
+    pub fn with_traffic_start_gate(mut self, gate: Arc<dyn TrafficStartGate>) -> Self {
+        self.traffic_start_gate = Some(gate);
+        self
+    }
+
+    /// Attach a deterministic weighted-pattern seed.
+    #[must_use]
+    pub fn with_rng_seed(mut self, seed: u64) -> Self {
+        self.rng_seed = Some(seed);
+        self
+    }
+
+    /// Attach the target revision and canonical tool-inventory hash used by
+    /// a distributed readiness frame.
+    #[must_use]
+    pub fn with_target_identity(
+        mut self,
+        protocol_version: String,
+        tool_inventory_hash: String,
+    ) -> Self {
+        self.target_identity = Some((protocol_version, tool_inventory_hash));
         self
     }
 

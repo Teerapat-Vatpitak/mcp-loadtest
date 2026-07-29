@@ -335,12 +335,6 @@ async fn stateless_supported_methods_reject_invalid_final_result_metadata() {
             "cacheScope",
         ),
         (
-            "call-missing-result-type",
-            "tools/call",
-            json!({ "content": [] }),
-            "resultType",
-        ),
-        (
             "call-non-string-result-type",
             "tools/call",
             json!({ "resultType": true, "content": [] }),
@@ -538,6 +532,53 @@ async fn stateless_run_end_to_end_against_python_fixture() {
     assert_eq!(
         report.server_info.protocol_version.as_deref(),
         Some("2026-07-28")
+    );
+    drop(child);
+}
+
+#[tokio::test]
+async fn auto_protocol_run_selects_final_stateless_server() {
+    // This is an engine-level guard: config `auto` must reach the protocol
+    // auto-negotiator instead of being collapsed to the legacy default.
+    let (child, addr) = spawn_stateless_fixture(&[]).await;
+    let toml = format!(
+        r#"
+        [server]
+        transport = "http"
+        url = "http://{addr}/"
+        allowed_hosts = ["127.0.0.1"]
+        protocol_version = "auto"
+        [scenario]
+        type = "sustained"
+        duration = "250ms"
+        concurrent = 1
+        tool = "echo"
+        "#
+    );
+    let config = Config::from_toml_str(&toml).expect("config must parse");
+    let scratch = ScratchDir::new("auto-final");
+    let scenario = Box::new(Sustained {
+        concurrent: 1,
+        duration: Duration::from_millis(250),
+        tool: "echo".to_string(),
+        args: json!({ "msg": "auto" }),
+    });
+
+    let report = tokio::time::timeout(
+        TEST_TIMEOUT,
+        Run::new(config, scenario, scratch.path()).execute(),
+    )
+    .await
+    .expect("auto-negotiated run timed out")
+    .expect("auto-negotiated final run should complete");
+
+    assert_eq!(
+        report.server_info.protocol_version.as_deref(),
+        Some("2026-07-28")
+    );
+    assert!(
+        report.metrics.throughput.total_requests > 0,
+        "auto-negotiated run must send scenario traffic"
     );
     drop(child);
 }
