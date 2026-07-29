@@ -63,7 +63,7 @@ jobs:
           asset_root="${RUNNER_TEMP}/action-contract-assets"
           package_root="${RUNNER_TEMP}/action-contract-package"
           shim_root="${RUNNER_TEMP}/action-contract-shims"
-          package_name="mcp-loadtest-v0.1.0-x86_64-unknown-linux-gnu"
+          package_name="mcp-loadtest-v0.2.0-x86_64-unknown-linux-gnu"
           asset_name="${package_name}.tar.gz"
           mkdir -p \
             "${asset_root}" \

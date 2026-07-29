@@ -41,7 +41,9 @@ $environment |
     Set-Content -LiteralPath (Join-Path $testArtifactDir "environment.txt") -Encoding utf8
 
 $sourceHashes = foreach ($sourceFile in (& git ls-files --cached --others --exclude-standard)) {
-    "$((& git hash-object -- $sourceFile).Trim())`t$sourceFile"
+    if (Test-Path -LiteralPath $sourceFile -PathType Leaf) {
+        "$((& git hash-object -- $sourceFile).Trim())`t$sourceFile"
+    }
 }
 $sourceHashes |
     Set-Content -LiteralPath (Join-Path $testArtifactDir "source-files.git-hash") -Encoding utf8

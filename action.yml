@@ -13,11 +13,11 @@ branding:
 inputs:
   version:
     description: >-
-      Release tag to install (e.g. "v0.1.0"). Defaults to the binary matching
+      Release tag to install (e.g. "v0.2.0"). Defaults to the binary matching
       this Action release. "latest" may be requested explicitly, but is less
       reproducible.
     required: false
-    default: "v0.1.0"
+    default: "v0.2.0"
   command:
     description: >-
       Subcommand to run: "deadlock-probe" (default), "run", "cross", or
@@ -112,7 +112,7 @@ runs:
         if ! mcp_loadtest_is_release_tag "$tag"; then
           # Do not interpolate an invalid caller value into workflow-command
           # output or an environment file.
-          echo "::error::version must resolve to a stable tag such as v0.1.0"
+          echo "::error::version must resolve to a stable tag such as v0.2.0"
           exit 2
         fi
         printf 'MCP_LOADTEST_VERSION=%s\n' "$tag" >> "$GITHUB_ENV"

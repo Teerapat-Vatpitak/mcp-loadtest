@@ -12,11 +12,13 @@ use crate::version::ProtocolVersion;
 
 mod example;
 mod load;
+mod schema;
 mod tool_slo;
 mod validate;
 
 pub use example::example_config;
 pub use load::*;
+pub use schema::{CONFIG_SCHEMA_JSON, config_schema, config_schema_pretty};
 pub use tool_slo::ToolSlo;
 pub use validate::{is_managed_remote_header, sanitize_remote_endpoint, validate_remote_endpoint};
 
@@ -45,6 +47,82 @@ pub struct Config {
     /// ADR 0005); set `[validation] strict = true` to opt in.
     #[serde(default)]
     pub validation: ValidationConfig,
+    /// Optional distributed load-generation controls. When present, the CLI
+    /// launches one short-lived worker on every configured SSH agent and
+    /// coordinates a single fail-closed run.
+    #[serde(default)]
+    pub distributed: Option<DistributedConfig>,
+}
+
+/// Distributed load-generation controls.
+///
+/// v0.2 uses short-lived workers launched through the local OpenSSH client.
+/// The workers exchange the versioned `mcp-loadtest-dist/1` protocol over
+/// stdin/stdout; there is no resident daemon to install or expose.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct DistributedConfig {
+    /// Require every configured agent to become ready and finish. v0.2
+    /// deliberately rejects `false` so partial clusters can never silently
+    /// produce a passing result.
+    #[serde(default = "distributed_require_all_agents")]
+    pub require_all_agents: bool,
+    /// Maximum time allowed to establish each SSH connection.
+    #[serde(default = "distributed_connect_timeout", with = "humantime_serde")]
+    pub connect_timeout: Duration,
+    /// Maximum time allowed for every worker to prepare its local sessions.
+    #[serde(default = "distributed_ready_timeout", with = "humantime_serde")]
+    pub ready_timeout: Duration,
+    /// Maximum silence allowed before a worker is considered lost.
+    #[serde(default = "distributed_heartbeat_timeout", with = "humantime_serde")]
+    pub heartbeat_timeout: Duration,
+    /// Lead time between the coordinated start message and traffic start.
+    #[serde(default = "distributed_start_lead", with = "humantime_serde")]
+    pub start_lead: Duration,
+    /// SSH workers participating in the run.
+    pub agents: Vec<DistributedAgentConfig>,
+}
+
+/// One ephemeral distributed worker reached through OpenSSH.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct DistributedAgentConfig {
+    /// Stable human-readable name used in diagnostics and run evidence.
+    pub name: String,
+    /// OpenSSH destination (host or `user@host`).
+    pub ssh_host: String,
+    /// Optional SSH port.
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+    /// Optional private-key path passed to OpenSSH with `-i`.
+    #[serde(default)]
+    pub identity_file: Option<PathBuf>,
+    /// Optional dedicated known-hosts file. Host-key checking remains
+    /// enabled; this only changes which trust store OpenSSH reads.
+    #[serde(default)]
+    pub known_hosts_file: Option<PathBuf>,
+}
+
+fn distributed_require_all_agents() -> bool {
+    true
+}
+
+fn distributed_connect_timeout() -> Duration {
+    Duration::from_secs(20)
+}
+
+fn distributed_ready_timeout() -> Duration {
+    Duration::from_secs(60)
+}
+
+fn distributed_heartbeat_timeout() -> Duration {
+    Duration::from_secs(15)
+}
+
+fn distributed_start_lead() -> Duration {
+    Duration::from_secs(1)
 }
 
 /// Opt-in protocol-validation block.
@@ -121,6 +199,220 @@ pub struct ServerConfig {
     /// live in checked-in TOML.
     #[serde(default)]
     pub headers_from_env: BTreeMap<String, String>,
+    /// Optional OAuth flow for remote transports. Secrets are referenced by
+    /// environment-variable name and resolved only by the auth runtime.
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
+}
+
+/// OAuth configuration for a remote MCP server.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct AuthConfig {
+    /// Authentication mechanism. v0.2 supports OAuth.
+    #[serde(rename = "type")]
+    pub kind: AuthKind,
+    /// Grant flow used to obtain an access token.
+    #[serde(default)]
+    pub flow: OAuthFlow,
+    /// Client registration strategy and its strategy-specific fields.
+    #[serde(flatten)]
+    pub registration: OAuthRegistration,
+    /// Initial requested scopes.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Request `offline_access` only when the authorization server advertises
+    /// support for that scope.
+    #[serde(default)]
+    pub offline_access: bool,
+    /// Maximum bounded 403 insufficient-scope step-up retries.
+    #[serde(default = "default_max_step_up_retries")]
+    pub max_step_up_retries: u8,
+}
+
+/// Authentication mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AuthKind {
+    /// OAuth 2.1 discovery and token acquisition.
+    #[serde(rename = "oauth")]
+    OAuth,
+}
+
+/// OAuth grant flow.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OAuthFlow {
+    /// Interactive authorization code with PKCE.
+    #[default]
+    AuthorizationCode,
+    /// Non-interactive client credentials extension.
+    ClientCredentials,
+}
+
+/// OAuth client registration strategy.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "registration", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OAuthRegistration {
+    /// Existing client credentials supplied by the operator.
+    PreRegistered {
+        /// Public OAuth client identifier.
+        client_id: String,
+        /// Optional environment variable containing the client secret.
+        #[serde(default)]
+        client_secret_env: Option<String>,
+        /// Token endpoint client authentication policy.
+        #[serde(default)]
+        token_endpoint_auth_method: TokenEndpointAuthMethod,
+    },
+    /// Client ID Metadata Document URL (CIMD).
+    ClientIdMetadata {
+        /// HTTPS URL that is itself the OAuth client identifier.
+        client_id_metadata_url: String,
+    },
+    /// Dynamic client registration using discovered server metadata.
+    Dynamic {
+        /// Optional human-readable client name sent during registration.
+        #[serde(default)]
+        client_name: Option<String>,
+    },
+}
+
+/// Token endpoint authentication method.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TokenEndpointAuthMethod {
+    /// Select from authorization-server metadata and available credentials.
+    #[default]
+    Auto,
+    /// Public client; no client authentication.
+    None,
+    /// HTTP Basic client authentication.
+    ClientSecretBasic,
+    /// Form-encoded client authentication.
+    ClientSecretPost,
+}
+
+fn default_max_step_up_retries() -> u8 {
+    2
+}
+
+/// Safe deserialization mirror for [`AuthConfig`].
+///
+/// `serde(deny_unknown_fields)` cannot be combined with a flattened tagged
+/// enum: the parent rejects the enum's `registration` discriminator before
+/// the enum sees it. This explicit wire keeps the desired flat TOML shape,
+/// rejects strategy-incompatible fields, and ensures unknown-field errors
+/// mention only a key name rather than echoing a line that may contain a
+/// credential.
+#[derive(Deserialize)]
+struct AuthConfigWire {
+    #[serde(rename = "type")]
+    kind: AuthKind,
+    #[serde(default)]
+    flow: OAuthFlow,
+    registration: String,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    client_secret_env: Option<String>,
+    #[serde(default)]
+    token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
+    #[serde(default)]
+    client_id_metadata_url: Option<String>,
+    #[serde(default)]
+    client_name: Option<String>,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    offline_access: bool,
+    #[serde(default = "default_max_step_up_retries")]
+    max_step_up_retries: u8,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, serde::de::IgnoredAny>,
+}
+
+impl<'de> Deserialize<'de> for AuthConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = AuthConfigWire::deserialize(deserializer)?;
+        if let Some(name) = wire.unknown.keys().next() {
+            return Err(<D::Error as serde::de::Error>::custom(format!(
+                "unknown field `{name}` in server.auth configuration"
+            )));
+        }
+
+        let registration = match wire.registration.as_str() {
+            "pre_registered" => {
+                if wire.client_id_metadata_url.is_some() || wire.client_name.is_some() {
+                    return Err(<D::Error as serde::de::Error>::custom(
+                        "server.auth pre_registered does not accept client_id_metadata_url or client_name",
+                    ));
+                }
+                OAuthRegistration::PreRegistered {
+                    client_id: wire.client_id.ok_or_else(|| {
+                        <D::Error as serde::de::Error>::custom(
+                            "server.auth.client_id is required for pre_registered",
+                        )
+                    })?,
+                    client_secret_env: wire.client_secret_env,
+                    token_endpoint_auth_method: wire.token_endpoint_auth_method.unwrap_or_default(),
+                }
+            }
+            "client_id_metadata" => {
+                if wire.client_id.is_some()
+                    || wire.client_secret_env.is_some()
+                    || wire.token_endpoint_auth_method.is_some()
+                    || wire.client_name.is_some()
+                {
+                    return Err(<D::Error as serde::de::Error>::custom(
+                        "server.auth client_id_metadata accepts only client_id_metadata_url",
+                    ));
+                }
+                OAuthRegistration::ClientIdMetadata {
+                    client_id_metadata_url: wire.client_id_metadata_url.ok_or_else(|| {
+                        <D::Error as serde::de::Error>::custom(
+                            "server.auth.client_id_metadata_url is required",
+                        )
+                    })?,
+                }
+            }
+            "dynamic" => {
+                if wire.client_id.is_some()
+                    || wire.client_secret_env.is_some()
+                    || wire.token_endpoint_auth_method.is_some()
+                    || wire.client_id_metadata_url.is_some()
+                {
+                    return Err(<D::Error as serde::de::Error>::custom(
+                        "server.auth dynamic registration accepts only client_name",
+                    ));
+                }
+                OAuthRegistration::Dynamic {
+                    client_name: wire.client_name,
+                }
+            }
+            other => {
+                return Err(<D::Error as serde::de::Error>::custom(format!(
+                    "server.auth.registration: unknown value `{other}`"
+                )));
+            }
+        };
+
+        Ok(Self {
+            kind: wire.kind,
+            flow: wire.flow,
+            registration,
+            scopes: wire.scopes,
+            offline_access: wire.offline_access,
+            max_step_up_retries: wire.max_step_up_retries,
+        })
+    }
 }
 
 /// Deserialization mirror for [`ServerConfig`].
@@ -153,6 +445,8 @@ struct ServerConfigWire {
     protocol_version: Option<String>,
     #[serde(default)]
     headers_from_env: BTreeMap<String, String>,
+    #[serde(default)]
+    auth: Option<AuthConfig>,
     #[serde(flatten)]
     unknown: BTreeMap<String, serde::de::IgnoredAny>,
 }
@@ -179,6 +473,7 @@ impl<'de> Deserialize<'de> for ServerConfig {
             allowed_hosts: wire.allowed_hosts,
             protocol_version: wire.protocol_version,
             headers_from_env: wire.headers_from_env,
+            auth: wire.auth,
         })
     }
 }
@@ -208,6 +503,7 @@ impl ServerConfig {
             allowed_hosts: Vec::new(),
             protocol_version: None,
             headers_from_env: BTreeMap::new(),
+            auth: None,
         }
     }
 
@@ -316,6 +612,105 @@ pub struct OutputConfig {
     /// Output formats to emit (`"markdown"`, `"json"`, `"terminal"`).
     #[serde(default = "default_formats")]
     pub formats: Vec<String>,
+    /// Optional one-shot OTLP/HTTP JSON export after the report is complete.
+    #[serde(default)]
+    pub otlp: Option<OtlpOutputConfig>,
+    /// Optional rolling baseline history and regression gate.
+    #[serde(default)]
+    pub history: Option<HistoryOutputConfig>,
+}
+
+/// OTLP/HTTP JSON exporter configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct OtlpOutputConfig {
+    /// Full metrics endpoint, normally ending in `/v1/metrics`.
+    pub endpoint: String,
+    /// Outbound header name to environment-variable name.
+    #[serde(default)]
+    pub headers_from_env: BTreeMap<String, String>,
+    /// Per-attempt request timeout.
+    #[serde(default = "default_otlp_timeout", with = "humantime_serde")]
+    pub timeout: Duration,
+    /// Fail the command when the collector ultimately rejects the batch.
+    #[serde(default)]
+    pub fail_on_error: bool,
+    /// Exact-match OTLP collector host allowlist.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// Maximum attempts including the first request.
+    #[serde(default = "default_otlp_max_attempts")]
+    pub max_attempts: u8,
+}
+
+/// Rolling history baseline configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct HistoryOutputConfig {
+    /// Portable series identifier (for example `main-sustained`).
+    pub series: String,
+    /// Root directory containing one subdirectory per series.
+    #[serde(default = "default_history_directory")]
+    pub directory: PathBuf,
+    /// Latest eligible passed samples used for the rolling median.
+    #[serde(default = "default_history_window")]
+    pub window: usize,
+    /// Samples required before relative regression gates activate.
+    #[serde(default = "default_history_min_samples")]
+    pub min_samples: usize,
+    /// Fail during warm-up instead of recording evidence and passing.
+    #[serde(default)]
+    pub require_history: bool,
+    /// Maximum permitted p99 latency increase in percent.
+    #[serde(default = "default_history_p99_regression_pct")]
+    pub max_p99_regression_pct: f64,
+    /// Maximum permitted error-rate increase in percentage points.
+    #[serde(default = "default_history_error_rate_regression_pp")]
+    pub max_error_rate_regression_pp: f64,
+    /// Optional maximum permitted aggregate throughput drop in percent.
+    #[serde(default = "default_history_rps_drop_pct")]
+    pub max_rps_drop_pct: Option<f64>,
+    /// Treat any increase in deadlocks as a regression.
+    #[serde(default = "history_deadlock_zero_tolerance")]
+    pub deadlock_zero_tolerance: bool,
+}
+
+fn default_otlp_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
+fn default_otlp_max_attempts() -> u8 {
+    3
+}
+
+fn default_history_directory() -> PathBuf {
+    PathBuf::from("./runs/history")
+}
+
+fn default_history_window() -> usize {
+    10
+}
+
+fn default_history_min_samples() -> usize {
+    3
+}
+
+fn default_history_p99_regression_pct() -> f64 {
+    10.0
+}
+
+fn default_history_error_rate_regression_pp() -> f64 {
+    0.5
+}
+
+fn default_history_rps_drop_pct() -> Option<f64> {
+    Some(10.0)
+}
+
+fn history_deadlock_zero_tolerance() -> bool {
+    true
 }
 
 impl OutputConfig {
@@ -324,6 +719,8 @@ impl OutputConfig {
         Self {
             report_dir,
             formats,
+            otlp: None,
+            history: None,
         }
     }
 }
@@ -333,6 +730,8 @@ impl Default for OutputConfig {
         Self {
             report_dir: default_report_dir(),
             formats: default_formats(),
+            otlp: None,
+            history: None,
         }
     }
 }
@@ -356,6 +755,7 @@ impl Config {
             thresholds: ThresholdsConfig::default(),
             output: OutputConfig::default(),
             validation: ValidationConfig::default(),
+            distributed: None,
         }
     }
 
@@ -377,6 +777,13 @@ impl Config {
     #[must_use]
     pub fn with_validation(mut self, validation: ValidationConfig) -> Self {
         self.validation = validation;
+        self
+    }
+
+    /// Builder: enable distributed load generation.
+    #[must_use]
+    pub fn with_distributed(mut self, distributed: DistributedConfig) -> Self {
+        self.distributed = Some(distributed);
         self
     }
 }

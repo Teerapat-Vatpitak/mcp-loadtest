@@ -2,7 +2,7 @@
 //! schema file stays focused on the structs themselves. The free fn shape lets
 //! `Config::from_toml_str` call it without an `impl` redirection.
 
-use super::{Config, ConfigError};
+use super::{Config, ConfigError, OAuthFlow, OAuthRegistration};
 use crate::version::ProtocolVersion;
 use url::Url;
 
@@ -73,6 +73,7 @@ pub(super) fn validate(cfg: &Config) -> Result<(), ConfigError> {
     }
 
     validate_remote_headers(cfg)?;
+    validate_auth(cfg)?;
 
     // protocol_version must be "auto" or a known revision (ADR 0018).
     if let Some(v) = &cfg.server.protocol_version
@@ -152,6 +153,392 @@ pub(super) fn validate(cfg: &Config) -> Result<(), ConfigError> {
         return Err(ConfigError::Invalid(
             "thresholds.hang_timeout: must be > 0".to_string(),
         ));
+    }
+
+    validate_distributed(cfg)?;
+    validate_output(cfg)?;
+
+    Ok(())
+}
+
+fn validate_output(cfg: &Config) -> Result<(), ConfigError> {
+    const FORMATS: &[&str] = &[
+        "terminal",
+        "markdown",
+        "json",
+        "html",
+        "junit",
+        "prometheus",
+    ];
+    let mut formats = std::collections::BTreeSet::new();
+    for format in &cfg.output.formats {
+        if !FORMATS.contains(&format.as_str()) {
+            return Err(ConfigError::Invalid(format!(
+                "output.formats: unknown format `{format}` (expected one of: {})",
+                FORMATS.join(", ")
+            )));
+        }
+        if !formats.insert(format.as_str()) {
+            return Err(ConfigError::Invalid(format!(
+                "output.formats: duplicate format `{format}`"
+            )));
+        }
+    }
+
+    if let Some(otlp) = &cfg.output.otlp {
+        if otlp.timeout.is_zero() {
+            return Err(ConfigError::Invalid(
+                "output.otlp.timeout: must be > 0".into(),
+            ));
+        }
+        if !(1..=10).contains(&otlp.max_attempts) {
+            return Err(ConfigError::Invalid(
+                "output.otlp.max_attempts: must be in 1..=10".into(),
+            ));
+        }
+        validate_https_or_loopback_url(&otlp.endpoint, "output.otlp.endpoint")?;
+        let parsed = Url::parse(&otlp.endpoint)
+            .map_err(|error| ConfigError::Invalid(format!("output.otlp.endpoint: {error}")))?;
+        if parsed.scheme() != "https" && !otlp.headers_from_env.is_empty() {
+            return Err(ConfigError::Invalid(
+                "output.otlp.headers_from_env requires an HTTPS endpoint".into(),
+            ));
+        }
+        validate_header_environment_map(&otlp.headers_from_env, "output.otlp.headers_from_env")?;
+        for host in &otlp.allowed_hosts {
+            validate_bare_host(host, "output.otlp.allowed_hosts")?;
+        }
+    }
+
+    if let Some(history) = &cfg.output.history {
+        if !portable_series_name(&history.series) {
+            return Err(ConfigError::Invalid(
+                "output.history.series: use 1..=64 ASCII letters, digits, `.`, `_`, or `-`".into(),
+            ));
+        }
+        if history.window == 0 {
+            return Err(ConfigError::Invalid(
+                "output.history.window: must be > 0".into(),
+            ));
+        }
+        if history.min_samples == 0 || history.min_samples > history.window {
+            return Err(ConfigError::Invalid(
+                "output.history.min_samples: must be in 1..=window".into(),
+            ));
+        }
+        for (field, value) in [
+            ("max_p99_regression_pct", history.max_p99_regression_pct),
+            (
+                "max_error_rate_regression_pp",
+                history.max_error_rate_regression_pp,
+            ),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(ConfigError::Invalid(format!(
+                    "output.history.{field}: must be finite and > 0"
+                )));
+            }
+        }
+        if history
+            .max_rps_drop_pct
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return Err(ConfigError::Invalid(
+                "output.history.max_rps_drop_pct: must be finite and > 0".into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn portable_series_name(value: &str) -> bool {
+    if value.is_empty() || value.len() > 64 {
+        return false;
+    }
+    let mut bytes = value.bytes();
+    if !bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return false;
+    }
+    let stem = value
+        .split('.')
+        .next()
+        .unwrap_or(value)
+        .to_ascii_uppercase();
+    !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        && !stem
+            .strip_prefix("COM")
+            .and_then(|suffix| suffix.parse::<u8>().ok())
+            .is_some_and(|number| (1..=9).contains(&number))
+        && !stem
+            .strip_prefix("LPT")
+            .and_then(|suffix| suffix.parse::<u8>().ok())
+            .is_some_and(|number| (1..=9).contains(&number))
+}
+
+fn validate_bare_host(host: &str, field: &str) -> Result<(), ConfigError> {
+    if host.is_empty()
+        || host.contains("://")
+        || host.contains('/')
+        || host.contains(':')
+        || host.chars().any(char::is_whitespace)
+    {
+        return Err(ConfigError::Invalid(format!(
+            "{field}: `{host}` must be a bare hostname"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_header_environment_map(
+    headers: &std::collections::BTreeMap<String, String>,
+    field: &str,
+) -> Result<(), ConfigError> {
+    let mut names = std::collections::BTreeSet::new();
+    for (name, env_name) in headers {
+        let folded = name.to_ascii_lowercase();
+        if !is_http_token(name) || is_managed_remote_header(&folded) {
+            return Err(ConfigError::Invalid(format!(
+                "{field}: invalid or managed HTTP header name `{name}`"
+            )));
+        }
+        if !names.insert(folded) {
+            return Err(ConfigError::Invalid(format!(
+                "{field}: duplicate header name `{name}`"
+            )));
+        }
+        if !is_portable_env_name(env_name) {
+            return Err(ConfigError::Invalid(format!(
+                "{field}: `{env_name}` is not a portable environment-variable name"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_auth(cfg: &Config) -> Result<(), ConfigError> {
+    let Some(auth) = &cfg.server.auth else {
+        return Ok(());
+    };
+
+    if !matches!(cfg.server.transport.as_str(), "http" | "sse") {
+        return Err(ConfigError::Invalid(
+            "server.auth is supported only for http and sse transports".into(),
+        ));
+    }
+    if cfg
+        .server
+        .headers_from_env
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("authorization"))
+    {
+        return Err(ConfigError::Invalid(
+            "server.auth is mutually exclusive with server.headers_from_env.Authorization".into(),
+        ));
+    }
+    if auth.max_step_up_retries > 3 {
+        return Err(ConfigError::Invalid(
+            "server.auth.max_step_up_retries: must be in 0..=3".into(),
+        ));
+    }
+    let mut scopes = std::collections::BTreeSet::new();
+    for scope in &auth.scopes {
+        if scope.is_empty() || scope.chars().any(char::is_whitespace) {
+            return Err(ConfigError::Invalid(format!(
+                "server.auth.scopes: `{scope}` must be a non-empty OAuth scope without whitespace"
+            )));
+        }
+        if !scopes.insert(scope) {
+            return Err(ConfigError::Invalid(format!(
+                "server.auth.scopes: duplicate scope `{scope}`"
+            )));
+        }
+    }
+
+    match &auth.registration {
+        OAuthRegistration::PreRegistered {
+            client_id,
+            client_secret_env,
+            ..
+        } => {
+            if client_id.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "server.auth.client_id: must not be empty".into(),
+                ));
+            }
+            if let Some(env_name) = client_secret_env
+                && !is_portable_env_name(env_name)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "server.auth.client_secret_env: `{env_name}` is not a portable environment-variable name"
+                )));
+            }
+            if auth.flow == OAuthFlow::ClientCredentials && client_secret_env.is_none() {
+                return Err(ConfigError::Invalid(
+                    "server.auth.client_credentials requires client_secret_env".into(),
+                ));
+            }
+        }
+        OAuthRegistration::ClientIdMetadata {
+            client_id_metadata_url,
+        } => {
+            if auth.flow == OAuthFlow::ClientCredentials {
+                return Err(ConfigError::Invalid(
+                    "server.auth.client_credentials requires registration = \"pre_registered\""
+                        .into(),
+                ));
+            }
+            validate_https_or_loopback_url(
+                client_id_metadata_url,
+                "server.auth.client_id_metadata_url",
+            )?;
+        }
+        OAuthRegistration::Dynamic { client_name } => {
+            if auth.flow == OAuthFlow::ClientCredentials {
+                return Err(ConfigError::Invalid(
+                    "server.auth.client_credentials requires registration = \"pre_registered\""
+                        .into(),
+                ));
+            }
+            if client_name
+                .as_ref()
+                .is_some_and(|name| name.trim().is_empty())
+            {
+                return Err(ConfigError::Invalid(
+                    "server.auth.client_name: must not be empty when provided".into(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_https_or_loopback_url(raw: &str, field: &str) -> Result<(), ConfigError> {
+    let parsed = Url::parse(raw)
+        .map_err(|error| ConfigError::Invalid(format!("{field}: invalid URL: {error}")))?;
+    let loopback = parsed.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+        return Err(ConfigError::Invalid(format!(
+            "{field}: must use HTTPS (HTTP is allowed only for loopback test fixtures)"
+        )));
+    }
+    if parsed.username() != "" || parsed.password().is_some() || parsed.fragment().is_some() {
+        return Err(ConfigError::Invalid(format!(
+            "{field}: userinfo and fragments are not allowed"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the deliberately narrow v0.2 distributed execution contract.
+fn validate_distributed(cfg: &Config) -> Result<(), ConfigError> {
+    let Some(distributed) = &cfg.distributed else {
+        return Ok(());
+    };
+
+    if !distributed.require_all_agents {
+        return Err(ConfigError::Invalid(
+            "distributed.require_all_agents: v0.2 requires true (partial clusters fail closed)"
+                .into(),
+        ));
+    }
+    if distributed.agents.len() < 2 {
+        return Err(ConfigError::Invalid(
+            "distributed.agents: at least 2 agents are required".into(),
+        ));
+    }
+    for (field, value) in [
+        ("connect_timeout", distributed.connect_timeout),
+        ("ready_timeout", distributed.ready_timeout),
+        ("heartbeat_timeout", distributed.heartbeat_timeout),
+        ("start_lead", distributed.start_lead),
+    ] {
+        if value.is_zero() {
+            return Err(ConfigError::Invalid(format!(
+                "distributed.{field}: must be > 0"
+            )));
+        }
+    }
+
+    let mut names = std::collections::BTreeSet::new();
+    let mut hosts = std::collections::BTreeSet::new();
+    for agent in &distributed.agents {
+        let name = agent.name.trim();
+        let host = agent.ssh_host.trim();
+        if name.is_empty() {
+            return Err(ConfigError::Invalid(
+                "distributed.agents.name: must not be empty".into(),
+            ));
+        }
+        if host.is_empty() || host.starts_with('-') || host.chars().any(char::is_whitespace) {
+            return Err(ConfigError::Invalid(format!(
+                "distributed agent `{name}`: ssh_host must be a non-empty OpenSSH destination without whitespace"
+            )));
+        }
+        if !names.insert(name) {
+            return Err(ConfigError::Invalid(format!(
+                "distributed.agents: duplicate agent name `{name}`"
+            )));
+        }
+        if !hosts.insert((host, agent.ssh_port)) {
+            return Err(ConfigError::Invalid(format!(
+                "distributed.agents: duplicate SSH destination `{host}`"
+            )));
+        }
+    }
+
+    if !matches!(cfg.server.transport.as_str(), "http" | "sse" | "ws") {
+        return Err(ConfigError::Invalid(
+            "distributed runs require server.transport = \"http\", \"sse\", or \"ws\"; remote stdio is unsupported"
+                .into(),
+        ));
+    }
+    if !matches!(cfg.scenario.kind.as_str(), "sustained" | "pattern") {
+        return Err(ConfigError::Invalid(format!(
+            "distributed runs support scenario.type = \"sustained\" or \"pattern\", got `{}`",
+            cfg.scenario.kind
+        )));
+    }
+    let concurrency = cfg
+        .scenario
+        .params
+        .get("concurrent")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(10);
+    if concurrency < distributed.agents.len() as u64 {
+        return Err(ConfigError::Invalid(format!(
+            "scenario.concurrent: distributed runs require at least one slot per agent ({} agents, got {concurrency})",
+            distributed.agents.len()
+        )));
+    }
+    if cfg.thresholds.memory_growth_mb.is_some() || cfg.thresholds.rss_leak_mb_per_sec.is_some() {
+        return Err(ConfigError::Invalid(
+            "distributed runs do not support process memory thresholds; worker processes do not own the remote MCP server"
+                .into(),
+        ));
+    }
+    if let Some(auth) = &cfg.server.auth {
+        if auth.flow != OAuthFlow::ClientCredentials {
+            return Err(ConfigError::Invalid(
+                "distributed OAuth requires flow = \"client_credentials\"; interactive authorization_code runs must execute locally"
+                    .into(),
+            ));
+        }
+        if auth.offline_access {
+            return Err(ConfigError::Invalid(
+                "distributed client_credentials OAuth does not support offline_access".into(),
+            ));
+        }
     }
 
     Ok(())

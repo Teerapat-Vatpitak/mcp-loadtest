@@ -17,5 +17,5 @@
 <!-- Linked issues, breaking changes, follow-ups, anything reviewers should know. -->
 
 ---
-By contributing you agree your changes are dual-licensed under MIT and Apache-2.0,
-matching the project. See [CONTRIBUTING.md](../CONTRIBUTING.md).
+By contributing you agree your changes are licensed under Apache-2.0, matching
+the current project. See [CONTRIBUTING.md](../CONTRIBUTING.md).

@@ -7,7 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-No changes have been assigned beyond `v0.1.0`.
+## [0.2.0] — Release candidate contents
+
+This section describes the source contents intended for `v0.2.0`. Its presence
+does not prove that the tag, checksums, platform archives, or GitHub Release
+have been published; verify those artifacts independently.
+
+### Added
+
+- Distributed load testing over ephemeral OpenSSH workers with a versioned
+  `mcp-loadtest-dist/1` control protocol, deterministic global-concurrency
+  sharding, coordinated readiness/start gates, heartbeat failure detection,
+  and exact cross-agent HDR histogram aggregation.
+- A bundled Draft 2020-12 configuration schema, available through
+  `mcp-loadtest config-schema`, for editor completion and validation.
+- JUnit XML and Prometheus text report files plus a bounded, retrying
+  OTLP/HTTP metrics exporter. Remote exporters use environment-backed headers,
+  redirect denial, DNS/address pinning, response limits, and explicit
+  fail-on-error policy.
+- Rolling baseline history with atomic sample publication, rolling-median
+  trends, warm-up policy, topology fingerprints, and CI gates for p99,
+  error-rate, throughput, and deadlock regressions.
+- Full client-role support for the final MCP `2026-07-28` revision, including
+  stateless discovery, required HTTP metadata, multi-round tool requests, and
+  local Draft 2020-12 schema validation without network `$ref` retrieval.
+- OAuth protected-resource/authorization-server discovery, pre-registered
+  clients, Client ID Metadata Documents, optional dynamic registration,
+  authorization-code + PKCE loopback callbacks, client credentials, refresh,
+  and bounded insufficient-scope step-up. Secrets remain environment-backed
+  and distributed workers acquire their own tokens locally.
+
+### Security
+
+- OAuth metadata and token endpoints are resolved, checked against
+  private/reserved address ranges, and pinned per request; redirects and proxy
+  re-resolution are disabled.
+- Distributed jobs never carry literal credentials or tokens. Agent-local
+  target policy can only narrow the controller request, and incomplete cohorts
+  fail closed without aggregate evidence.
+
+### Changed
+
+- Changed the license for development after `v0.1.0` to Apache-2.0. The
+  immutable `v0.1.0` release retains its original `MIT OR Apache-2.0` terms.
 
 ## [0.1.0] — Release contents
 

@@ -131,6 +131,12 @@ pub enum SessionError {
         /// Version the client advertised.
         advertised: String,
     },
+    /// A single-round caller encountered a 2026-07-28 input-required result.
+    #[error("tool call requires an additional input round; use call_tool_round")]
+    AdditionalInputRequired,
+    /// MRTR input responses must be a JSON object keyed by request ID.
+    #[error("tools/call inputResponses must be a JSON object")]
+    InvalidInputResponses,
 }
 
 /// A single MCP session over an opaque [`Transport`].

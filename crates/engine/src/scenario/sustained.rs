@@ -168,14 +168,15 @@ async fn drive_pooled_patterns(
     patterns: Vec<Pattern>,
     ctx: &RunContext,
 ) -> ScenarioOutcome {
-    // Deadline anchored *before* the spawn phase: pool spin-up cost counts
-    // against the configured duration, mirroring the sequential path where
-    // `duration` starts ticking when `drive` begins.
-    let deadline = Instant::now() + duration;
     let patterns = Arc::new(patterns);
     pool::drive_pooled(ctx, workers, move |_idx, mut session, worker_ctx| {
         let patterns = Arc::clone(&patterns);
         async move {
+            // `drive_pooled` resets `run_start` to the local coordinated
+            // traffic instant after every local session is ready. Pool
+            // startup and distributed SSH preparation therefore never eat
+            // into the requested measurement window.
+            let deadline = worker_ctx.run_start + duration;
             let mut outcome =
                 drive_until_deadline(deadline, &patterns, &mut session, &worker_ctx).await;
             teardown::shutdown_session(session, &mut outcome, "sustained pooled worker").await;
@@ -195,7 +196,51 @@ async fn run_loop(
     session: &mut Session,
     ctx: &RunContext,
 ) -> ScenarioOutcome {
-    let deadline = Instant::now() + duration;
+    let traffic_start = match &ctx.traffic_start_gate {
+        Some(gate) => {
+            let (target_protocol_version, tool_inventory_hash) = ctx
+                .target_identity
+                .clone()
+                .unwrap_or_else(|| ("unknown".into(), "unknown".into()));
+            let start = tokio::select! {
+                result = gate.ready_and_start_at(crate::scenario::TrafficReadiness {
+                    live_workers: 1,
+                    requested_workers: 1,
+                    target_protocol_version,
+                    tool_inventory_hash,
+                }) => result,
+                _ = ctx.cancel_token.cancelled() => {
+                    Err(crate::scenario::TrafficStartError::Cancelled)
+                }
+            };
+            match start {
+                Ok(start) => start,
+                Err(error) => {
+                    return ScenarioOutcome {
+                        incomplete_worker_count: 1,
+                        notes: vec![format!("sustained: traffic start gate failed: {error}")],
+                        ..ScenarioOutcome::default()
+                    };
+                }
+            }
+        }
+        None => Instant::now(),
+    };
+    if traffic_start > Instant::now() {
+        tokio::select! {
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(traffic_start)) => {}
+            _ = ctx.cancel_token.cancelled() => {
+                return ScenarioOutcome {
+                    incomplete_worker_count: 1,
+                    notes: vec![
+                        "sustained: cancelled while waiting for coordinated traffic start".into()
+                    ],
+                    ..ScenarioOutcome::default()
+                };
+            }
+        }
+    }
+    let deadline = traffic_start + duration;
     let mut outcome = drive_until_deadline(deadline, patterns, session, ctx).await;
     if concurrent > 1 {
         outcome.notes.insert(
@@ -237,7 +282,10 @@ async fn drive_until_deadline(
     // `Send`-friendly RNG seeded from entropy. `ThreadRng` would be ideal but
     // is `!Send`, and `Scenario::drive` returns a `Send` future via
     // `async_trait`. `StdRng` (ChaCha12) is fine for weighted-random picks.
-    let mut rng = StdRng::from_os_rng();
+    let mut rng = match ctx.rng_seed {
+        Some(seed) => StdRng::seed_from_u64(seed),
+        None => StdRng::from_os_rng(),
+    };
 
     loop {
         // Check cancellation / deadline *before* each iteration.

@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and release (e.g. v0.1.0)"
+        description: "Existing tag to build and release (e.g. v0.2.0)"
         required: true
 
 permissions:
@@ -111,7 +111,7 @@ jobs:
       - name: Run repeat/stress gate (no retries)
         run: bash scripts/repeat-tests.sh 5 target/test-artifacts/release-repeat
 
-      - name: Run latest official scoped scenarios for final-spec subset
+      - name: Run all applicable official MCP client scenarios
         run: bash crates/protocol/tests/run-official-conformance.sh
 
       - name: Upload release-gate evidence
@@ -173,7 +173,7 @@ jobs:
           dir="mcp-loadtest-${ver}-${{ matrix.target }}"
           mkdir "$dir"
           cp "target/${{ matrix.target }}/release/mcp-loadtest" "$dir/"
-          cp README.md LICENSE-MIT LICENSE-APACHE "$dir/"
+          cp README.md LICENSE "$dir/"
           tar -czf "${dir}.tar.gz" "$dir"
           shasum -a 256 "${dir}.tar.gz" > "${dir}.tar.gz.sha256"
 
@@ -185,7 +185,7 @@ jobs:
           $dir = "mcp-loadtest-$ver-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $dir | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/mcp-loadtest.exe" $dir
-          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $dir
+          Copy-Item README.md, LICENSE $dir
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           $h = (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash.ToLower()
           # LF, no BOM, "<hash>  <name>" — matches the unix `shasum` sidecar so
@@ -300,8 +300,8 @@ jobs:
             printf '```\n\n'
             printf 'Or download a prebuilt archive below and verify it with the matching `.sha256` file.\n'
             printf '\n**Known limitations**\n\n'
-            printf -- '- Remote authentication is limited to static environment-backed request headers. Any such header requires HTTPS/WSS, URL userinfo is forbidden, and query strings are transmitted but wholly redacted in reports/traces and must not carry secrets. There is no OAuth discovery, login, refresh, DCR, DPoP, or token store.\n'
-            printf -- '- MCP `2026-07-28` final-spec support is scoped. The retained official-client run covers five tools/discover, request-metadata, and request-header scenarios—not the full, auth, MRTR/request-state, subscriptions/listen, schema-reference, server, or authorization-server suites. The pinned harness still places this revision in its draft slot and vendors a pre-final schema; the final schema delta is confined to subscriptions/listen, outside the executed scope.\n'
+            printf -- '- Remote OAuth supports protected-resource/authorization-server discovery, authorization code + PKCE, client credentials, CIMD, optional DCR, refresh, and bounded scope step-up. Secrets remain environment-backed; DPoP and persistent token storage are not included.\n'
+            printf -- '- MCP `2026-07-28` support covers the full applicable official client-role scenario inventory, including authorization, MRTR/request-state, HTTP metadata, and safe local JSON Schema references. Server-role, authorization-server-role, and subscriptions/listen conformance are outside this client load-generator claim.\n'
             printf '  [Reviewed conformance scope](https://github.com/%s/blob/%s/crates/protocol/tests/conformance-scope-2026-07-28.tsv).\n' \
               "$GITHUB_REPOSITORY" "$RELEASE_TAG"
           } >"$notes"

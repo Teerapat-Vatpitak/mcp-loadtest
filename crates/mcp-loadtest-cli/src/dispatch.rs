@@ -24,6 +24,10 @@ pub(crate) async fn dispatch(cmd: Cmd) -> Result<()> {
             print!("{}", mcp_loadtest::config::example_config());
             Ok(())
         }
+        Cmd::ConfigSchema => {
+            print_stdout(&mcp_loadtest::config::config_schema_pretty());
+            Ok(())
+        }
         Cmd::ListScenarios => {
             println!(
                 "sustained        — steady workload; also accepts weighted tool_call/pattern configs"
@@ -165,6 +169,12 @@ pub(crate) async fn dispatch(cmd: Cmd) -> Result<()> {
                 .await
                 .context("running mcp-loadtest serve --mcp")?;
             Ok(())
+        }
+        Cmd::DistributedAgent { stdio } => {
+            if !stdio {
+                anyhow::bail!("distributed agents currently require --stdio");
+            }
+            mcp_loadtest_cli::distributed::run_stdio_agent().await
         }
     }
 }

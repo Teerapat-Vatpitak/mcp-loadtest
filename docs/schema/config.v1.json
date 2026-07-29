@@ -1,0 +1,1693 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Teerapat-Vatpitak/mcp-loadtest/main/docs/schema/config.v1.json",
+  "title": "mcp-loadtest configuration",
+  "description": "Editor-facing schema for mcp-loadtest v0.2 TOML configuration. Runtime semantic validation remains authoritative for network policy and cross-field numeric relationships.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "server",
+    "scenario"
+  ],
+  "properties": {
+    "server": {
+      "$ref": "#/$defs/server"
+    },
+    "scenario": {
+      "$ref": "#/$defs/scenario"
+    },
+    "thresholds": {
+      "$ref": "#/$defs/thresholds",
+      "default": {}
+    },
+    "output": {
+      "$ref": "#/$defs/output",
+      "default": {}
+    },
+    "validation": {
+      "$ref": "#/$defs/validation",
+      "default": {}
+    },
+    "distributed": {
+      "$ref": "#/$defs/distributed"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "distributed"
+        ]
+      },
+      "then": {
+        "properties": {
+          "server": {
+            "allOf": [
+              {
+                "properties": {
+                  "transport": {
+                    "enum": [
+                      "http",
+                      "sse",
+                      "ws"
+                    ]
+                  }
+                },
+                "required": [
+                  "transport"
+                ]
+              },
+              {
+                "if": {
+                  "required": [
+                    "auth"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "auth": {
+                      "properties": {
+                        "flow": {
+                          "const": "client_credentials"
+                        },
+                        "offline_access": {
+                          "const": false
+                        }
+                      },
+                      "required": [
+                        "flow"
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "scenario": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/sustainedScenario"
+              },
+              {
+                "$ref": "#/$defs/patternScenario"
+              }
+            ]
+          },
+          "thresholds": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "memory_growth_mb"
+                  ]
+                },
+                {
+                  "required": [
+                    "rss_leak_mb_per_sec"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "duration": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^\\s*[0-9]",
+      "description": "Human-readable duration accepted by humantime, for example 250ms, 5s, or 2m 30s."
+    },
+    "positiveDuration": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/duration"
+        }
+      ],
+      "description": "A non-zero human-readable duration. The runtime enforces the non-zero constraint."
+    },
+    "envName": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+      "description": "Portable environment-variable name. The value is resolved only at runtime."
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "argsObject": {
+      "type": "object",
+      "description": "JSON-compatible MCP tool arguments.",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "headerEnvironmentMap": {
+      "type": "object",
+      "description": "Outbound HTTP header name to environment-variable name. Values are never literal secrets.",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/envName"
+      },
+      "default": {}
+    },
+    "auth": {
+      "title": "OAuth authentication",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "registration"
+      ],
+      "properties": {
+        "type": {
+          "const": "oauth"
+        },
+        "flow": {
+          "type": "string",
+          "enum": [
+            "authorization_code",
+            "client_credentials"
+          ],
+          "default": "authorization_code"
+        },
+        "registration": {
+          "type": "string",
+          "enum": [
+            "pre_registered",
+            "client_id_metadata",
+            "dynamic"
+          ]
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^\\S+$"
+          },
+          "uniqueItems": true,
+          "default": []
+        },
+        "offline_access": {
+          "type": "boolean",
+          "default": false
+        },
+        "max_step_up_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3,
+          "default": 2
+        },
+        "client_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "client_secret_env": {
+          "$ref": "#/$defs/envName"
+        },
+        "token_endpoint_auth_method": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "none",
+            "client_secret_basic",
+            "client_secret_post"
+          ],
+          "default": "auto"
+        },
+        "client_id_metadata_url": {
+          "type": "string",
+          "format": "uri",
+          "anyOf": [
+            {
+              "pattern": "^https://"
+            },
+            {
+              "pattern": "^http://(?:localhost|127(?:\\.[0-9]{1,3}){3}|\\[::1\\])(?::[0-9]+)?(?:/|$)"
+            }
+          ]
+        },
+        "client_name": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "oneOf": [
+        {
+          "title": "Pre-registered client",
+          "properties": {
+            "registration": {
+              "const": "pre_registered"
+            }
+          },
+          "required": [
+            "client_id"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "client_id_metadata_url"
+                ]
+              },
+              {
+                "required": [
+                  "client_name"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "title": "Client ID Metadata Document",
+          "properties": {
+            "registration": {
+              "const": "client_id_metadata"
+            }
+          },
+          "required": [
+            "client_id_metadata_url"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "client_id"
+                ]
+              },
+              {
+                "required": [
+                  "client_secret_env"
+                ]
+              },
+              {
+                "required": [
+                  "token_endpoint_auth_method"
+                ]
+              },
+              {
+                "required": [
+                  "client_name"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "title": "Dynamic client registration",
+          "properties": {
+            "registration": {
+              "const": "dynamic"
+            }
+          },
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "client_id"
+                ]
+              },
+              {
+                "required": [
+                  "client_secret_env"
+                ]
+              },
+              {
+                "required": [
+                  "token_endpoint_auth_method"
+                ]
+              },
+              {
+                "required": [
+                  "client_id_metadata_url"
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "flow": {
+                "const": "client_credentials"
+              }
+            },
+            "required": [
+              "flow"
+            ]
+          },
+          "then": {
+            "properties": {
+              "registration": {
+                "const": "pre_registered"
+              },
+              "offline_access": {
+                "const": false
+              }
+            },
+            "required": [
+              "client_secret_env"
+            ]
+          }
+        }
+      ]
+    },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "transport": {
+          "type": "string",
+          "enum": [
+            "stdio",
+            "http",
+            "sse",
+            "ws"
+          ],
+          "default": "stdio"
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "working_dir": {
+          "$ref": "#/$defs/path"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "startup_timeout": {
+          "$ref": "#/$defs/positiveDuration",
+          "default": "10s"
+        },
+        "allowed_hosts": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\s/:]+$"
+          },
+          "uniqueItems": true,
+          "default": []
+        },
+        "protocol_version": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25",
+            "2026-07-28"
+          ],
+          "default": "auto"
+        },
+        "headers_from_env": {
+          "$ref": "#/$defs/headerEnvironmentMap"
+        },
+        "auth": {
+          "$ref": "#/$defs/auth"
+        }
+      },
+      "oneOf": [
+        {
+          "title": "stdio",
+          "properties": {
+            "transport": {
+              "const": "stdio"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "url"
+                ]
+              },
+              {
+                "required": [
+                  "headers_from_env"
+                ]
+              },
+              {
+                "required": [
+                  "auth"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "title": "Streamable HTTP",
+          "properties": {
+            "transport": {
+              "const": "http"
+            },
+            "url": {
+              "pattern": "^https?://"
+            }
+          },
+          "required": [
+            "transport",
+            "url"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "command"
+                ]
+              },
+              {
+                "required": [
+                  "args"
+                ]
+              },
+              {
+                "required": [
+                  "env"
+                ]
+              },
+              {
+                "required": [
+                  "working_dir"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "title": "Legacy HTTP plus SSE",
+          "properties": {
+            "transport": {
+              "const": "sse"
+            },
+            "url": {
+              "pattern": "^https?://"
+            },
+            "protocol_version": {
+              "enum": [
+                "auto",
+                "2025-03-26",
+                "2025-06-18",
+                "2025-11-25"
+              ]
+            }
+          },
+          "required": [
+            "transport",
+            "url"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "command"
+                ]
+              },
+              {
+                "required": [
+                  "args"
+                ]
+              },
+              {
+                "required": [
+                  "env"
+                ]
+              },
+              {
+                "required": [
+                  "working_dir"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "title": "WebSocket",
+          "properties": {
+            "transport": {
+              "const": "ws"
+            },
+            "url": {
+              "pattern": "^wss?://"
+            },
+            "protocol_version": {
+              "enum": [
+                "auto",
+                "2025-03-26",
+                "2025-06-18",
+                "2025-11-25"
+              ]
+            }
+          },
+          "required": [
+            "transport",
+            "url"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "command"
+                ]
+              },
+              {
+                "required": [
+                  "args"
+                ]
+              },
+              {
+                "required": [
+                  "env"
+                ]
+              },
+              {
+                "required": [
+                  "working_dir"
+                ]
+              },
+              {
+                "required": [
+                  "auth"
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "auth"
+            ]
+          },
+          "then": {
+            "properties": {
+              "headers_from_env": {
+                "propertyNames": {
+                  "not": {
+                    "pattern": "^[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]$"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "headers_from_env": {
+                "minProperties": 1
+              }
+            },
+            "required": [
+              "headers_from_env"
+            ]
+          },
+          "then": {
+            "properties": {
+              "url": {
+                "pattern": "^(?:https|wss)://"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "toolSlo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool",
+        "p99_latency"
+      ],
+      "properties": {
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "p99_latency": {
+          "$ref": "#/$defs/positiveDuration"
+        }
+      }
+    },
+    "thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "p50_latency": {
+          "$ref": "#/$defs/positiveDuration"
+        },
+        "p95_latency": {
+          "$ref": "#/$defs/positiveDuration"
+        },
+        "p99_latency": {
+          "$ref": "#/$defs/positiveDuration"
+        },
+        "p999_latency": {
+          "$ref": "#/$defs/positiveDuration"
+        },
+        "error_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "hang_timeout": {
+          "$ref": "#/$defs/positiveDuration"
+        },
+        "memory_growth_mb": {
+          "type": "number",
+          "minimum": 0
+        },
+        "rss_leak_mb_per_sec": {
+          "type": "number",
+          "minimum": 0
+        },
+        "tool_slos": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/toolSlo"
+          },
+          "default": []
+        }
+      }
+    },
+    "otlpOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "endpoint"
+      ],
+      "properties": {
+        "endpoint": {
+          "type": "string",
+          "format": "uri",
+          "anyOf": [
+            {
+              "pattern": "^https://"
+            },
+            {
+              "pattern": "^http://(?:localhost|127(?:\\.[0-9]{1,3}){3}|\\[::1\\])(?::[0-9]+)?(?:/|$)"
+            }
+          ]
+        },
+        "headers_from_env": {
+          "$ref": "#/$defs/headerEnvironmentMap"
+        },
+        "timeout": {
+          "$ref": "#/$defs/positiveDuration",
+          "default": "10s"
+        },
+        "fail_on_error": {
+          "type": "boolean",
+          "default": false
+        },
+        "allowed_hosts": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\s/:]+$"
+          },
+          "uniqueItems": true,
+          "default": []
+        },
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "default": 3
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "headers_from_env": {
+                "minProperties": 1
+              }
+            },
+            "required": [
+              "headers_from_env"
+            ]
+          },
+          "then": {
+            "properties": {
+              "endpoint": {
+                "pattern": "^https://"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "historyOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "series"
+      ],
+      "properties": {
+        "series": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+          "description": "Portable baseline-series token. Windows reserved device names are rejected by the runtime."
+        },
+        "directory": {
+          "$ref": "#/$defs/path",
+          "default": "./runs/history"
+        },
+        "window": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10
+        },
+        "min_samples": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3
+        },
+        "require_history": {
+          "type": "boolean",
+          "default": false
+        },
+        "max_p99_regression_pct": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 10
+        },
+        "max_error_rate_regression_pp": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 0.5
+        },
+        "max_rps_drop_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0,
+          "default": 10
+        },
+        "deadlock_zero_tolerance": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "report_dir": {
+          "$ref": "#/$defs/path",
+          "default": "./runs"
+        },
+        "formats": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "terminal",
+              "markdown",
+              "json",
+              "html",
+              "junit",
+              "prometheus"
+            ]
+          },
+          "uniqueItems": true,
+          "default": [
+            "terminal",
+            "markdown",
+            "json"
+          ]
+        },
+        "otlp": {
+          "$ref": "#/$defs/otlpOutput"
+        },
+        "history": {
+          "$ref": "#/$defs/historyOutput"
+        }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strict": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "distributedAgent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "ssh_host"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ssh_host": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!-)[^\\s]+$",
+          "description": "OpenSSH destination, for example loadgen@example.net."
+        },
+        "ssh_port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "identity_file": {
+          "$ref": "#/$defs/path"
+        },
+        "known_hosts_file": {
+          "$ref": "#/$defs/path"
+        }
+      }
+    },
+    "distributed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agents"
+      ],
+      "properties": {
+        "require_all_agents": {
+          "const": true,
+          "default": true,
+          "description": "v0.2 is fail-closed and does not permit partial clusters."
+        },
+        "connect_timeout": {
+          "$ref": "#/$defs/positiveDuration",
+          "default": "20s"
+        },
+        "ready_timeout": {
+          "$ref": "#/$defs/positiveDuration",
+          "default": "60s"
+        },
+        "heartbeat_timeout": {
+          "$ref": "#/$defs/positiveDuration",
+          "default": "15s"
+        },
+        "start_lead": {
+          "$ref": "#/$defs/positiveDuration",
+          "default": "1s"
+        },
+        "agents": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "$ref": "#/$defs/distributedAgent"
+          },
+          "description": "At least two agents with unique names and SSH destinations. scenario.concurrent must be at least this array length; the runtime enforces both relationships."
+        }
+      }
+    },
+    "patternStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Legacy alias for tool."
+        },
+        "args": {
+          "$ref": "#/$defs/argsObject"
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "tool"
+          ]
+        },
+        {
+          "required": [
+            "name"
+          ]
+        }
+      ]
+    },
+    "pattern": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "weight": {
+          "type": "number",
+          "default": 1
+        },
+        "think_time": {
+          "$ref": "#/$defs/duration",
+          "default": "0s"
+        },
+        "on_step_error": {
+          "type": "string",
+          "enum": [
+            "continue",
+            "abort"
+          ],
+          "default": "continue"
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/patternStep"
+          }
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Single-step shorthand when steps is omitted."
+        },
+        "args": {
+          "$ref": "#/$defs/argsObject"
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "steps"
+          ]
+        },
+        {
+          "required": [
+            "tool"
+          ]
+        }
+      ]
+    },
+    "patterns": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/pattern"
+      },
+      "description": "At least one pattern must have a finite positive weight; the runtime enforces this aggregate rule."
+    },
+    "legacyToolCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "args": {
+          "$ref": "#/$defs/argsObject"
+        },
+        "weight": {
+          "type": "number",
+          "default": 1
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "name"
+          ]
+        },
+        {
+          "required": [
+            "tool"
+          ]
+        }
+      ]
+    },
+    "singleToolFields": {
+      "type": "object",
+      "properties": {
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "args": {
+          "$ref": "#/$defs/argsObject"
+        }
+      }
+    },
+    "sustainedScenario": {
+      "title": "Sustained load",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "sustained"
+        },
+        "concurrent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 10
+        },
+        "duration": {
+          "$ref": "#/$defs/positiveDuration",
+          "default": "60s"
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "args": {
+          "$ref": "#/$defs/argsObject"
+        },
+        "patterns": {
+          "$ref": "#/$defs/patterns"
+        },
+        "tool_call": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/legacyToolCall"
+          }
+        },
+        "tool_calls": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/legacyToolCall"
+          }
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "tool"
+          ]
+        },
+        {
+          "required": [
+            "patterns"
+          ]
+        },
+        {
+          "required": [
+            "tool_call"
+          ]
+        },
+        {
+          "required": [
+            "tool_calls"
+          ]
+        }
+      ]
+    },
+    "deadlockProbeScenario": {
+      "title": "Deadlock probe",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "tool"
+      ],
+      "properties": {
+        "type": {
+          "const": "deadlock_probe"
+        },
+        "concurrent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 20
+        },
+        "hang_threshold": {
+          "$ref": "#/$defs/positiveDuration",
+          "default": "5s"
+        },
+        "grace_period": {
+          "$ref": "#/$defs/duration",
+          "default": "10s"
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "args": {
+          "$ref": "#/$defs/argsObject"
+        }
+      }
+    },
+    "coldStartScenario": {
+      "title": "Cold start",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "tool"
+      ],
+      "properties": {
+        "type": {
+          "const": "cold_start"
+        },
+        "iterations": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 5
+        },
+        "warmup": {
+          "type": "boolean",
+          "default": true
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "args": {
+          "$ref": "#/$defs/argsObject"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "warmup": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "iterations": {
+                "minimum": 2
+              }
+            }
+          }
+        }
+      ]
+    },
+    "spikeScenario": {
+      "title": "Traffic spike",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "tool"
+      ],
+      "properties": {
+        "type": {
+          "const": "spike"
+        },
+        "baseline_concurrent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 5
+        },
+        "spike_concurrent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 50
+        },
+        "warmup": {
+          "$ref": "#/$defs/duration",
+          "default": "30s"
+        },
+        "spike_duration": {
+          "$ref": "#/$defs/positiveDuration",
+          "default": "30s"
+        },
+        "cooldown": {
+          "$ref": "#/$defs/duration",
+          "default": "30s"
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "args": {
+          "$ref": "#/$defs/argsObject"
+        }
+      }
+    },
+    "breakingPoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_p99_latency": {
+          "$ref": "#/$defs/positiveDuration"
+        },
+        "p99_latency": {
+          "$ref": "#/$defs/positiveDuration",
+          "description": "Legacy alias for max_p99_latency."
+        },
+        "max_error_rate": {
+          "type": "number",
+          "minimum": 0
+        },
+        "error_rate": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Legacy alias for max_error_rate."
+        },
+        "window_secs": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "rampScenario": {
+      "title": "Concurrency ramp",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "tool"
+      ],
+      "properties": {
+        "type": {
+          "const": "ramp"
+        },
+        "from_concurrent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "ramp_from": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "description": "Legacy alias for from_concurrent."
+        },
+        "from": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "description": "Legacy alias for from_concurrent."
+        },
+        "to_concurrent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "ramp_to": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "description": "Legacy alias for to_concurrent."
+        },
+        "to": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "description": "Legacy alias for to_concurrent."
+        },
+        "step_duration": {
+          "$ref": "#/$defs/positiveDuration"
+        },
+        "step": {
+          "$ref": "#/$defs/positiveDuration",
+          "description": "Legacy alias for step_duration."
+        },
+        "ramp_step": {
+          "$ref": "#/$defs/positiveDuration",
+          "description": "Legacy alias for step_duration."
+        },
+        "step_increment": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 1
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "args": {
+          "$ref": "#/$defs/argsObject"
+        },
+        "breaking_point": {
+          "$ref": "#/$defs/breakingPoint"
+        }
+      },
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "required": [
+                "from_concurrent"
+              ]
+            },
+            {
+              "required": [
+                "ramp_from"
+              ]
+            },
+            {
+              "required": [
+                "from"
+              ]
+            }
+          ]
+        },
+        {
+          "anyOf": [
+            {
+              "required": [
+                "to_concurrent"
+              ]
+            },
+            {
+              "required": [
+                "ramp_to"
+              ]
+            },
+            {
+              "required": [
+                "to"
+              ]
+            }
+          ]
+        },
+        {
+          "anyOf": [
+            {
+              "required": [
+                "step_duration"
+              ]
+            },
+            {
+              "required": [
+                "step"
+              ]
+            },
+            {
+              "required": [
+                "ramp_step"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "soakScenario": {
+      "title": "Soak test",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "tool"
+      ],
+      "properties": {
+        "type": {
+          "const": "soak"
+        },
+        "concurrent": {
+          "const": 1,
+          "default": 1
+        },
+        "duration": {
+          "$ref": "#/$defs/positiveDuration",
+          "default": "60s"
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "args": {
+          "$ref": "#/$defs/argsObject"
+        },
+        "sample_interval": {
+          "$ref": "#/$defs/positiveDuration",
+          "default": "10s"
+        },
+        "latency_drift_ms_per_sec": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0
+        }
+      }
+    },
+    "raceCheckScenario": {
+      "title": "Race check",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "tool"
+      ],
+      "properties": {
+        "type": {
+          "const": "race_check"
+        },
+        "concurrent": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 4294967295,
+          "default": 10
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "args": {
+          "$ref": "#/$defs/argsObject"
+        }
+      }
+    },
+    "fuzzerScenario": {
+      "title": "Protocol fuzzer",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "const": "fuzzer"
+        },
+        "iterations": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 50
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "default": 12648430
+        },
+        "payloads": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "EmptyBody",
+              "EmptyObject",
+              "InvalidJson",
+              "MissingJsonRpcVersion",
+              "WrongJsonRpcVersion",
+              "UnknownMethod",
+              "NumericMethod",
+              "MissingId",
+              "DuplicateId",
+              "GiantPayload",
+              "ControlChars",
+              "Nested",
+              "NullParams",
+              "StringParams"
+            ]
+          }
+        }
+      }
+    },
+    "patternScenario": {
+      "title": "Weighted multi-step pattern",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "pattern"
+        },
+        "concurrent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 10
+        },
+        "duration": {
+          "$ref": "#/$defs/positiveDuration",
+          "default": "60s"
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "args": {
+          "$ref": "#/$defs/argsObject"
+        },
+        "patterns": {
+          "$ref": "#/$defs/patterns"
+        },
+        "tool_call": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/legacyToolCall"
+          }
+        },
+        "tool_calls": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/legacyToolCall"
+          }
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "tool"
+          ]
+        },
+        {
+          "required": [
+            "patterns"
+          ]
+        },
+        {
+          "required": [
+            "tool_call"
+          ]
+        },
+        {
+          "required": [
+            "tool_calls"
+          ]
+        }
+      ]
+    },
+    "versionMatrixScenario": {
+      "title": "MCP revision matrix",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "tool"
+      ],
+      "properties": {
+        "type": {
+          "const": "version_matrix"
+        },
+        "versions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "2025-03-26",
+              "2025-06-18",
+              "2025-11-25",
+              "2026-07-28"
+            ]
+          },
+          "description": "Explicit revisions to test. Omit for every handshake-negotiated revision."
+        },
+        "calls_per_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 10
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "args": {
+          "$ref": "#/$defs/argsObject"
+        }
+      }
+    },
+    "scenario": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sustainedScenario"
+        },
+        {
+          "$ref": "#/$defs/deadlockProbeScenario"
+        },
+        {
+          "$ref": "#/$defs/coldStartScenario"
+        },
+        {
+          "$ref": "#/$defs/rampScenario"
+        },
+        {
+          "$ref": "#/$defs/soakScenario"
+        },
+        {
+          "$ref": "#/$defs/spikeScenario"
+        },
+        {
+          "$ref": "#/$defs/fuzzerScenario"
+        },
+        {
+          "$ref": "#/$defs/raceCheckScenario"
+        },
+        {
+          "$ref": "#/$defs/patternScenario"
+        },
+        {
+          "$ref": "#/$defs/versionMatrixScenario"
+        }
+      ]
+    }
+  }
+}

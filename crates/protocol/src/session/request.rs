@@ -16,7 +16,9 @@ use super::{Session, SessionError, connection, strict};
 use crate::jsonrpc::{
     JSONRPC_VERSION, OutgoingNotification, OutgoingRequest, ResponseEnvelope, ResponsePayload,
 };
-use crate::mcp::{CallToolParams, CallToolResult, ListToolsResult, ProtocolVersion, Tool};
+use crate::mcp::{
+    CallToolParams, CallToolResult, ListToolsResult, ProtocolVersion, Tool, ToolCallRound,
+};
 
 fn response_shape_error(method: &str, detail: &str) -> SessionError {
     SessionError::ResponseShape(<serde_json::Error as serde::de::Error>::custom(format!(
@@ -33,7 +35,9 @@ fn validate_final_stateless_result(method: &str, result: &Value) -> Result<(), S
         .ok_or_else(|| response_shape_error(method, "must be an object"))?;
 
     match object.get("resultType") {
-        Some(Value::String(result_type)) if result_type == "complete" => {}
+        Some(Value::String(result_type))
+            if result_type == "complete"
+                || (method == "tools/call" && result_type == "input_required") => {}
         Some(Value::String(result_type)) => {
             return Err(response_shape_error(
                 method,
@@ -46,6 +50,9 @@ fn validate_final_stateless_result(method: &str, result: &Value) -> Result<(), S
                 "field `resultType` must be the string `complete`",
             ));
         }
+        // Backward compatibility required by the final spec: a tools/call
+        // result without a discriminator is a complete result.
+        None if method == "tools/call" => {}
         None => {
             return Err(response_shape_error(
                 method,
@@ -140,8 +147,12 @@ impl Session {
             strict::check_args(schemas, name, arguments)?;
         }
 
-        let params = CallToolParams { name, arguments };
-        let result: CallToolResult = self.request("tools/call", &params).await?;
+        let result = match self.call_tool_round(name, arguments, None, None).await? {
+            ToolCallRound::Complete(result) => result,
+            ToolCallRound::InputRequired(_) => {
+                return Err(SessionError::AdditionalInputRequired);
+            }
+        };
 
         // Opt-in result-side validation (DESIGN §13.1 item 2). Same
         // single-`Option`-branch hot-path discipline as args (ADR 0006).
@@ -152,6 +163,32 @@ impl Session {
             strict::check_result(schemas, name, &result)?;
         }
         Ok(result)
+    }
+
+    /// Execute one multi-round `tools/call` exchange.
+    ///
+    /// For a continuation, pass the previous round's exact `requestState`
+    /// and an object mapping each input-request key to its client result.
+    /// Legacy servers simply return [`ToolCallRound::Complete`].
+    pub async fn call_tool_round(
+        &mut self,
+        name: &str,
+        arguments: &Value,
+        request_state: Option<&str>,
+        input_responses: Option<&Value>,
+    ) -> Result<ToolCallRound, SessionError> {
+        if let Some(responses) = input_responses
+            && !responses.is_object()
+        {
+            return Err(SessionError::InvalidInputResponses);
+        }
+        let params = CallToolParams {
+            name,
+            arguments,
+            request_state,
+            input_responses,
+        };
+        self.request("tools/call", &params).await
     }
 
     /// Send **raw, unframed bytes** straight to the transport, bypassing

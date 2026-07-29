@@ -16,12 +16,13 @@ workspace = true
 tui = ["dep:ratatui", "dep:crossterm"]
 
 [dependencies]
-mcp-loadtest-core = { path = "../core", version = "0.1.0" }
+mcp-loadtest-core = { path = "../core", version = "0.2.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 console = { workspace = true }
 tracing = { workspace = true }
+reqwest = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 ratatui = { workspace = true, optional = true }

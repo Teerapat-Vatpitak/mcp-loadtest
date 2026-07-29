@@ -61,7 +61,7 @@ jobs:
           retention-days: 14
 
   protocol-conformance:
-    name: MCP 2026-07-28 final-spec subset vs provisional harness
+    name: MCP 2026-07-28 full client-role conformance
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -74,7 +74,7 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Run latest official scoped scenarios for final-spec subset
+      - name: Run all applicable official client scenarios
         run: bash crates/protocol/tests/run-official-conformance.sh
 
       - name: Upload conformance evidence

@@ -132,6 +132,12 @@ pub(crate) struct CallToolParams<'a> {
     pub name: &'a str,
     /// JSON-shaped arguments.
     pub arguments: &'a Value,
+    /// Opaque server state returned by an earlier input-required round.
+    #[serde(rename = "requestState", skip_serializing_if = "Option::is_none")]
+    pub request_state: Option<&'a str>,
+    /// Client responses keyed by the server's input-request identifiers.
+    #[serde(rename = "inputResponses", skip_serializing_if = "Option::is_none")]
+    pub input_responses: Option<&'a Value>,
 }
 
 /// Result returned by `tools/call`.
@@ -150,6 +156,59 @@ pub struct CallToolResult {
     /// if the server sent one (2025-06-18 MCP spec addition).
     #[serde(rename = "structuredContent", default)]
     pub structured_content: Option<Value>,
+}
+
+/// A server response requesting another round trip before a tool call can finish.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InputRequiredResult {
+    /// Protocol result metadata.
+    #[serde(rename = "_meta", default)]
+    pub meta: Option<Value>,
+    /// Server-initiated requests keyed by server-assigned identifiers.
+    #[serde(rename = "inputRequests", default)]
+    pub input_requests: Option<serde_json::Map<String, Value>>,
+    /// Opaque state to return unchanged on the next round.
+    #[serde(rename = "requestState", default)]
+    pub request_state: Option<String>,
+    /// Result discriminator, required to be `input_required`.
+    #[serde(rename = "resultType")]
+    pub result_type: String,
+}
+
+/// One round of an MCP 2026-07-28 tool call.
+#[derive(Debug, Clone)]
+pub enum ToolCallRound {
+    /// The tool call completed.
+    Complete(CallToolResult),
+    /// The server needs client input before continuing.
+    InputRequired(InputRequiredResult),
+}
+
+impl<'de> Deserialize<'de> for ToolCallRound {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match value.get("resultType").and_then(Value::as_str) {
+            Some("input_required") => {
+                let input: InputRequiredResult =
+                    serde_json::from_value(value).map_err(de::Error::custom)?;
+                if input.request_state.is_none() && input.input_requests.is_none() {
+                    return Err(de::Error::custom(
+                        "input_required result needs requestState or inputRequests",
+                    ));
+                }
+                Ok(Self::InputRequired(input))
+            }
+            Some("complete") | None => serde_json::from_value(value)
+                .map(Self::Complete)
+                .map_err(de::Error::custom),
+            Some(other) => Err(de::Error::custom(format!(
+                "unsupported tools/call resultType `{other}`"
+            ))),
+        }
+    }
 }
 
 /// A piece of content returned by a tool call.

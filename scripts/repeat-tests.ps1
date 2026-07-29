@@ -87,7 +87,9 @@ if (Get-Command python -ErrorAction SilentlyContinue) {
 $environment | Set-Content -LiteralPath (Join-Path $OutputDir "environment.txt") -Encoding utf8
 
 $sourceHashes = foreach ($sourceFile in (& git ls-files --cached --others --exclude-standard)) {
-    "$((& git hash-object -- $sourceFile).Trim())`t$sourceFile"
+    if (Test-Path -LiteralPath $sourceFile) {
+        "$((& git hash-object -- $sourceFile).Trim())`t$sourceFile"
+    }
 }
 $sourceHashes |
     Set-Content -LiteralPath (Join-Path $OutputDir "source-files.git-hash") -Encoding utf8

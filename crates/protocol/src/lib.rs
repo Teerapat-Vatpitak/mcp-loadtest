@@ -10,6 +10,7 @@ pub mod transport;
 
 pub use factory::SessionFactory;
 pub use hang_detector::{HangOutcome, hang_detect};
+pub use mcp::{InputRequiredResult, ToolCallRound};
 pub use session::{Session, SessionError};
 pub use transport::{Transport, TransportError};
 

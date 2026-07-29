@@ -5,7 +5,7 @@ non-zero for threshold violations and unconditional correctness failures such
 as no successful calls, deadlocks, response divergences, and terminal
 transport failures.
 
-> **Availability note:** use the examples pinned to `v0.1.0` only when the
+> **Availability note:** use the examples pinned to `v0.2.0` only when the
 > exact tag and its published GitHub Release exist and GitHub immutable
 > releases is enabled. Source text and a manifest version do not prove
 > availability. Otherwise, test by building an authorized checkout under
@@ -14,7 +14,7 @@ transport failures.
 ## Quickest path: the composite action
 
 This repo contains a composite GitHub Action ([`action.yml`](../../action.yml)
-at the repo root). With a verified `v0.1.0` Release, an exact `uses:` pin gets
+at the repo root). With a verified `v0.2.0` Release, an exact `uses:` pin gets
 you a deadlock probe on every PR:
 
 ```yaml
@@ -40,9 +40,9 @@ jobs:
             - name: Deadlock probe
               id: loadtest
               # Post-release only: pin the immutable exact version.
-              uses: Teerapat-Vatpitak/mcp-loadtest@v0.1.0
+              uses: Teerapat-Vatpitak/mcp-loadtest@v0.2.0
               with:
-                  version: v0.1.0
+                  version: v0.2.0
                   server: "python -m my_mcp"
                   # JSON array: each element becomes exactly one argv entry.
                   # Shell syntax is never evaluated.
@@ -71,7 +71,7 @@ that is the regression gate. The action uploads nothing itself; keep the
 | `server`            | — (required)     | Server command string passed to `--server`, e.g. `"python -m my_mcp"`. Ignored by `command: run` (TOML has it). |
 | `command`           | `deadlock-probe` | One of `deadlock-probe`, `run`, `cross`, `doctor`. For `run`, pass `--config ci.toml` via `args`.               |
 | `args`              | `[]`             | Extra CLI arguments as a JSON array of strings. Each element is one literal argument; shell syntax is rejected. |
-| `version`           | `v0.1.0`         | Stable release tag of the binary to install. Set `latest` explicitly only when reproducibility is not required. |
+| `version`           | `v0.2.0`         | Stable release tag of the binary to install. Set `latest` explicitly only when reproducibility is not required. |
 | `baseline`          | `""`             | Baseline `metrics.json` for a single-report `run` or `deadlock-probe`; rejected for `cross` and `doctor`.       |
 | `working-directory` | `.`              | Directory to run in.                                                                                            |
 
@@ -173,7 +173,7 @@ jobs:
 
             # Post-release example: install from the immutable git tag.
             - name: Install mcp-loadtest
-              run: cargo install --git https://github.com/Teerapat-Vatpitak/mcp-loadtest --tag v0.1.0 --locked mcp-loadtest-cli
+              run: cargo install --git https://github.com/Teerapat-Vatpitak/mcp-loadtest --tag v0.2.0 --locked mcp-loadtest-cli
 
             # Headline check — fails the build on any deadlock.
             - name: Deadlock probe

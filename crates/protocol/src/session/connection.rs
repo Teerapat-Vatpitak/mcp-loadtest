@@ -66,6 +66,70 @@ impl<'a, P: ?Sized + Serialize> WithMeta<'a, P> {
 }
 
 impl Session {
+    /// Auto-detect the final stateless protocol, falling back to the latest
+    /// legacy handshake when the probe is unsupported.
+    ///
+    /// `server/discover` is attempted with 2026-07-28 metadata first. A
+    /// JSON-RPC failure other than the three final-protocol errors
+    /// (-32020..=-32022), or a probe timeout, falls back on the same
+    /// transport to `initialize` with 2025-11-25. Final-protocol errors fail
+    /// closed and are never mistaken for a legacy server.
+    pub async fn from_transport_auto<T>(
+        transport: T,
+        startup_timeout: Duration,
+    ) -> Result<Self, SessionError>
+    where
+        T: Transport + 'static,
+    {
+        const DISCOVER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+        let modern = ProtocolVersion::V2026_07_28;
+        let mut session = Session {
+            transport: Box::new(transport),
+            next_id: 1,
+            server_protocol_version: modern.as_str().to_owned(),
+            advertised_version: modern,
+            negotiated_version: None,
+            stateless: Some(StatelessMeta {
+                version: modern,
+                client_info: ClientInfo {
+                    name: "mcp-loadtest".to_owned(),
+                    version: crate::VERSION.to_owned(),
+                },
+                capabilities: serde_json::json!({}),
+            }),
+            tool_schemas: None,
+            tool_output_schemas: None,
+        };
+        session.transport.set_protocol_version(modern.as_str());
+        let probe_timeout = startup_timeout.min(DISCOVER_PROBE_TIMEOUT);
+        let probe = tokio::time::timeout(probe_timeout, session.discover()).await;
+        match probe {
+            Ok(Ok(())) => return Ok(session),
+            Ok(Err(SessionError::Server(error))) if matches!(error.code, -32022..=-32020) => {
+                return Err(cleanup_failed_startup(session, SessionError::Server(error)).await);
+            }
+            Ok(Err(SessionError::Server(_))) | Err(_) => {}
+            Ok(Err(error)) => return Err(cleanup_failed_startup(session, error).await),
+        }
+
+        let legacy = ProtocolVersion::V2025_11_25;
+        session.stateless = None;
+        session.advertised_version = legacy;
+        session.negotiated_version = None;
+        session.server_protocol_version.clear();
+        session.transport.set_protocol_version(legacy.as_str());
+        let startup = tokio::time::timeout(startup_timeout, session.initialize()).await;
+        match startup {
+            Ok(Ok(())) => Ok(session),
+            Ok(Err(error)) => Err(cleanup_failed_startup(session, error).await),
+            Err(_) => Err(cleanup_failed_startup(
+                session,
+                SessionError::StartupTimeout(startup_timeout),
+            )
+            .await),
+        }
+    }
+
     /// Construct a **stateless** (2026-07-28) session over any transport
     /// (ADR 0019; wired for stdio + Streamable HTTP). No
     /// `initialize` is sent; instead one bounded `server/discover` probes

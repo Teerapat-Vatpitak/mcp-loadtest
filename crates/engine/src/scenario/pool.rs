@@ -46,7 +46,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-use crate::scenario::{RunContext, ScenarioOutcome};
+use crate::scenario::{RunContext, ScenarioOutcome, TrafficReadiness, teardown};
 use mcp_loadtest_core::metrics::CallOutcome;
 use mcp_loadtest_protocol::Session;
 use mcp_loadtest_protocol::session::SessionError;
@@ -132,6 +132,71 @@ where
     sessions.sort_by_key(|(idx, _)| *idx);
     let spawned = sessions.len();
 
+    // Phase 1b: only a fully prepared local pool may announce readiness to a
+    // distributed coordinator. Local runs use `Instant::now()` here. The
+    // returned instant is local and monotonic; distributed wire messages
+    // carry a relative lead time rather than comparing clocks across hosts.
+    let traffic_start = match &ctx.traffic_start_gate {
+        Some(gate) => {
+            let (target_protocol_version, tool_inventory_hash) = ctx
+                .target_identity
+                .clone()
+                .unwrap_or_else(|| ("unknown".into(), "unknown".into()));
+            let start = tokio::select! {
+                result = gate.ready_and_start_at(TrafficReadiness {
+                    live_workers: sessions.len() as u32,
+                    requested_workers: requested,
+                    target_protocol_version,
+                    tool_inventory_hash,
+                }) => result,
+                _ = ctx.cancel_token.cancelled() => {
+                    Err(crate::scenario::TrafficStartError::Cancelled)
+                }
+            };
+            match start {
+                Ok(start) => start,
+                Err(error) => {
+                    outcome.incomplete_worker_count = outcome
+                        .incomplete_worker_count
+                        .saturating_add(sessions.len() as u64);
+                    outcome
+                        .notes
+                        .push(format!("pool: traffic start gate failed: {error}"));
+                    for (idx, session) in sessions {
+                        teardown::shutdown_session(
+                            session,
+                            &mut outcome,
+                            format!("pool worker {idx} before traffic start"),
+                        )
+                        .await;
+                    }
+                    return outcome;
+                }
+            }
+        }
+        None => std::time::Instant::now(),
+    };
+    if traffic_start > std::time::Instant::now() {
+        tokio::select! {
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(traffic_start)) => {}
+            _ = ctx.cancel_token.cancelled() => {
+                outcome.incomplete_worker_count = outcome
+                    .incomplete_worker_count
+                    .saturating_add(sessions.len() as u64);
+                outcome.notes.push("pool: cancelled while waiting for coordinated traffic start".into());
+                for (idx, session) in sessions {
+                    teardown::shutdown_session(
+                        session,
+                        &mut outcome,
+                        format!("pool worker {idx} before cancelled traffic start"),
+                    )
+                    .await;
+                }
+                return outcome;
+            }
+        }
+    }
+
     // Phase 2: one task per live session, all handles kept in the JoinSet
     // and every one awaited below (cancellation is observed *inside* each
     // worker loop via the shared token in its worker context).
@@ -144,7 +209,7 @@ where
     // requested sessions spawned successfully.
     let (start_tx, start_rx) = watch::channel(false);
     for (idx, session) in sessions {
-        let fut = per_worker(idx, session, worker_context(ctx));
+        let fut = per_worker(idx, session, worker_context(ctx, traffic_start, idx));
         let mut start_rx = start_rx.clone();
         workers.spawn(async move {
             let _ = start_rx.wait_for(|released| *released).await;
@@ -176,14 +241,25 @@ where
 /// Per-worker [`RunContext`]: shares the caller's cancel token, (Arc-backed)
 /// metrics recorder and hang/grace thresholds. Deliberately carries **no**
 /// session factory — workers drive the one session they were handed.
-fn worker_context(ctx: &RunContext) -> RunContext {
-    RunContext::new(
-        ctx.run_start,
+fn worker_context(
+    ctx: &RunContext,
+    traffic_start: std::time::Instant,
+    worker_index: u32,
+) -> RunContext {
+    let mut worker = RunContext::new(
+        traffic_start,
         ctx.cancel_token.clone(),
         ctx.metrics.clone(),
         ctx.hang_threshold,
         ctx.grace_period,
-    )
+    );
+    if let Some(seed) = ctx.rng_seed {
+        worker = worker.with_rng_seed(seed ^ u64::from(worker_index));
+    }
+    if let Some((protocol, inventory)) = &ctx.target_identity {
+        worker = worker.with_target_identity(protocol.clone(), inventory.clone());
+    }
+    worker
 }
 
 /// Fold one worker's outcome into the pool total: sum every counter, append
